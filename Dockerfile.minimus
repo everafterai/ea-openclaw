@@ -20,7 +20,7 @@ RUN apt-get update \
 # Baked-in checksums for pinned binary versions. These are public, immutable
 # facts — override only if upgrading the binary version above.
 ARG GOG_SHA256=28219f4a57478b3c38d5b33cfcb00f53a5943784b96c3b47e6dd877b384c5a13
-ARG GOPLACES_SHA256=68274cfd7515b4fdacc1ce8a7ab052f75a2a8f7a2f9344f8e8591acb3a1a842a
+ARG GOPLACES_SHA256=a03b05b64f8cfcd382dc22c2815a55c2cd7955f63b3507543146607734eac16d
 
 RUN test -n "$GOG_SHA256" && test -n "$GOPLACES_SHA256"
 
