@@ -1,6 +1,12 @@
-# 02 — OpenClaw on EC2 (Docker)
+# 02 — OpenClaw on EC2 (Minimus image)
 
 **Run this on the EC2 instance** (SSH in first). Nothing runs on your local machine.
+
+This walkthrough uses the fork (`everafterai/ea-openclaw`), which ships:
+
+- `Dockerfile.minimus` — thin child of [Minimus's hardened distroless OpenClaw](https://www.minimus.io/post/stop-running-openclaw-with-2-000-vulnerabilities-why-minimus-openclaw-image-has-99-fewer-cves) (~7 CVEs vs ~2,000 in the official image), with `gog` + `goplaces` skill binaries copied in (checksumed).
+- `docker-compose.prod.yml` — production overlay: loopback-only port bindings, `cap_drop: ALL`, resource limits.
+- `.env.example` — operator template (deploy section is at the bottom).
 
 **Reference:** [OpenClaw docs](https://docs.openclaw.ai/)
 
@@ -31,17 +37,11 @@ Log out and back in for the group change:
 exit
 ```
 
-Then SSH in again:
-
-```bash
-ssh -i keys/open-claw.pem ubuntu@<EC2_PUBLIC_DNS>
-```
-
-Verify:
+Then SSH in again. Verify:
 
 ```bash
 docker --version
-docker compose version
+docker compose version       # must be v2.20+ (for `!override` list-replace tags)
 ```
 
 ## 2a. zsh + oh-my-zsh + zsh-autosuggestions (optional)
@@ -52,232 +52,160 @@ CHSH=yes RUNZSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh
 git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
 ```
 
-Edit `~/.zshrc` and add `zsh-autosuggestions` to the plugins line:
-
-```bash
-nano ~/.zshrc
-```
-
-Change `plugins=(git)` to `plugins=(git zsh-autosuggestions)`.
-
-Set zsh as default shell:
+Edit `~/.zshrc`, change `plugins=(git)` to `plugins=(git zsh-autosuggestions)`. Then:
 
 ```bash
 chsh -s $(which zsh)
 ```
 
-Log out and SSH back in for it to take effect.
+Log out and SSH back in.
 
-## 3. Clone OpenClaw
+## 3. Clone the fork
 
 ```bash
-git clone https://github.com/openclaw/openclaw.git
-cd openclaw
+git clone https://github.com/everafterai/ea-openclaw.git ~/ea-openclaw
+cd ~/ea-openclaw
 ```
 
-## 4. Create persistent dirs
+Use the SSH form (`git@github.com:everafterai/ea-openclaw.git`) if you've added an SSH key to GitHub from this VM.
+
+## 4. Persistent dirs
 
 ```bash
-mkdir -p ~/.openclaw
-mkdir -p ~/.openclaw/workspace
+mkdir -p ~/.openclaw ~/.openclaw/workspace
 ```
 
-## 5. Create `.env`
+These are bind-mounted into the container as `/home/node/.openclaw` and the workspace.
+
+## 5. Configure `.env`
 
 ```bash
-# Generate secrets
-openssl rand -hex 32
-# Use output for tokens below
-
+cp .env.example .env
 nano .env
 ```
 
-Paste (replace secrets with output from `openssl rand -hex 32`):
+At minimum, set these in the **Deploy / docker-compose** section near the bottom:
 
 ```
-OPENCLAW_IMAGE=openclaw:local
-OPENCLAW_GATEWAY_TOKEN=<your-token>
-OPENCLAW_GATEWAY_BIND=lan
-OPENCLAW_GATEWAY_PORT=18789
-OPENCLAW_CONFIG_DIR=/home/$USER/.openclaw
-OPENCLAW_WORKSPACE_DIR=/home/$USER/.openclaw/workspace
-GOG_KEYRING_PASSWORD=<your-secret>
-XDG_CONFIG_HOME=/home/node/.openclaw
+OPENCLAW_GATEWAY_TOKEN=<openssl rand -hex 32>
+GOG_KEYRING_PASSWORD=<openssl rand -hex 32>
+OPENCLAW_CONFIG_DIR=/home/ubuntu/.openclaw
+OPENCLAW_WORKSPACE_DIR=/home/ubuntu/.openclaw/workspace
 ```
-The base `docker-compose.yml` may reference `CLAUDE_AI_SESSION_KEY`, `CLAUDE_WEB_SESSION_KEY`, `CLAUDE_WEB_COOKIE` — add those to `.env` only if using Claude integration.
 
-**Do not commit `.env`.** Add it to `.gitignore` if not already.
-
-## 6. Docker Compose override
-
-The repo already has `docker-compose.yml`. Create `docker-compose.override.yml` to add build, env file, and loopback-only binding (the gateway is reached over the SSH tunnel, never directly exposed):
+Generate the two random secrets:
 
 ```bash
-nano docker-compose.override.yml
+openssl rand -hex 32
+openssl rand -hex 32
 ```
 
-```yaml
-services:
-  openclaw-gateway:
-    build: .
-    env_file:
-      - .env
-    environment:
-      GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD}
-      XDG_CONFIG_HOME: /home/node/.openclaw
-    ports:
-      - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
-      - "127.0.0.1:${OPENCLAW_BRIDGE_PORT:-18790}:18790"
-```
+Set model provider API keys you'll use (see `walkthrough/03-VERTEX-GEMINI.md` for Gemini specifics). `.env` is gitignored — never commit it.
 
-This merges with the base config.
+## 6. Compose alias
 
-## 7. Dockerfile changes
-
-Edit the repo's `Dockerfile` and add the following **after** the `OPENCLAW_DOCKER_APT_PACKAGES` block (after the `fi`), **before** `COPY package.json`:
-
-```dockerfile
-# Skills: socat + gog, goplaces (Gmail, Places). gog repo is gogcli.
-RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
-RUN curl -L -o /tmp/gog.tar.gz https://github.com/steipete/gogcli/releases/download/v0.9.0/gogcli_0.9.0_linux_amd64.tar.gz \
-  && tar -xzf /tmp/gog.tar.gz -C /usr/local/bin && chmod +x /usr/local/bin/gog && rm /tmp/gog.tar.gz
-RUN curl -L -o /tmp/goplaces.tar.gz https://github.com/steipete/goplaces/releases/download/v0.2.1/goplaces_0.2.1_linux_amd64.tar.gz \
-  && tar -xzf /tmp/goplaces.tar.gz -C /usr/local/bin && chmod +x /usr/local/bin/goplaces && rm /tmp/goplaces.tar.gz
-```
-
-**Note:** wacli (WhatsApp) has no Linux release in v0.2.0; omit if not needed. gog is from the `gogcli` repo.
-
-**Alternative:** Use `--build-arg OPENCLAW_DOCKER_APT_PACKAGES="socat"` and add only the two `RUN curl ...` lines.
-
-## 8. Build and run
-
-On t3.small (2GB RAM), `pnpm install` can OOM during build. Add swap first:
+`docker-compose.prod.yml` is **not** auto-merged (the auto-merge name `docker-compose.override.yml` is gitignored by upstream openclaw and reserved for local-machine tweaks). Always invoke with both `-f` flags. One-time alias:
 
 ```bash
-sudo fallocate -l 2G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
+echo "alias dcp='docker compose -f docker-compose.yml -f docker-compose.prod.yml'" >> ~/.zshrc
+source ~/.zshrc
 ```
 
-To persist swap across reboots: `echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab`
+(Use `~/.bashrc` if you skipped section 2a.)
 
-Then build:
+## 7. Build and run
 
 ```bash
-docker compose build
-docker compose up -d openclaw-gateway
+dcp build openclaw-gateway
+dcp up -d openclaw-gateway
 ```
 
-Verify binaries:
+Build is fast (~30s) — the Minimus image is prebuilt; the only work is fetching it and copying `gog` + `goplaces` in. **No swap needed** (no `pnpm install` at build time).
+
+If you want to add a local-only tweak that won't be committed (e.g. machine-specific volume mounts, debug flags), drop a `docker-compose.override.yml` next to `docker-compose.prod.yml`. Compose auto-merges it; it's gitignored upstream.
+
+## 8. Verify the binaries
+
+The Minimus image is distroless — no shell, no `which`, no `ls`. Probe the binaries directly by full path:
 
 ```bash
-docker compose exec openclaw-gateway which gog
-docker compose exec openclaw-gateway which goplaces
+dcp exec openclaw-gateway /usr/local/bin/gog --help
+dcp exec openclaw-gateway /usr/local/bin/goplaces --help
 ```
 
-Expected: `/usr/local/bin/gog`, `/usr/local/bin/goplaces`
+If either errors with "executable file not found", the COPY step in `Dockerfile.minimus` either failed or landed somewhere other than `/usr/local/bin`. For deeper poking, attach a debug sidecar that shares the gateway's volumes:
+
+```bash
+docker run --rm -it --volumes-from $(dcp ps -q openclaw-gateway) debian:12-slim bash
+```
+
+The most authoritative check is the gateway's own startup log — if openclaw discovers and registers the skills, you'll see them mentioned in section 9's logs.
 
 ## 9. Check logs
 
 ```bash
-docker compose logs -f openclaw-gateway
+dcp logs -f openclaw-gateway
 ```
 
-Success: `[gateway] listening on ws://0.0.0.0:18789`
+Success: `[gateway] listening on ws://0.0.0.0:18789`.
 
 ## 10. Access from laptop (SSH tunnel)
 
-On your local machine:
+On your local machine, from the project root (where `keys/open-claw.pem` lives — host is in `keys/help.md`):
 
 ```bash
 ssh -i keys/open-claw.pem -L 18789:127.0.0.1:18789 ubuntu@<EC2_PUBLIC_DNS>
 ```
 
-Run from the project root (where `keys/open-claw.pem` lives). The host is in `keys/help.md`.
-
 Browser: http://127.0.0.1:18789/ — paste gateway token.
 
 ---
 
-## 11. Hardening (optional)
+## 11. Optional further hardening
 
-The walkthrough above gets you running but is not hardened. The cheap wins:
+The fork already bakes in: `cap_drop: ALL`, `no-new-privileges`, loopback-only ports, resource limits, checksum-verified binary downloads, multi-arch-pinned Minimus base. Cheap wins on top:
 
-### 11a. Verify the container's runtime user
-
-```bash
-docker compose exec openclaw-gateway id
-```
-
-If it prints `uid=0(root)`, the image runs as root. The OpenClaw image typically runs as the `node` user (uid 1000). If it doesn't, pin it explicitly in the override (next step).
-
-### 11b. Drop capabilities and block privilege escalation
-
-Edit `~/openclaw/docker-compose.override.yml` and extend the `openclaw-gateway` service:
-
-```yaml
-services:
-  openclaw-gateway:
-    # ...existing keys...
-    user: "1000:1000"          # match the image's non-root user; adjust if `id` showed something else
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    read_only: true
-    tmpfs:
-      - /tmp
-      - /run
-```
-
-Then `docker compose up -d` and re-test. If something breaks, remove `read_only: true` first and re-add capabilities one at a time (`cap_add: [NET_BIND_SERVICE]` etc.) only as needed.
-
-### 11c. Pin and checksum the skill binaries
-
-Replace the unchecked downloads in section 7 with verified ones. Compute the checksums once on a trusted machine:
+### 11a. Verify the runtime user
 
 ```bash
-curl -L https://github.com/steipete/gogcli/releases/download/v0.9.0/gogcli_0.9.0_linux_amd64.tar.gz | sha256sum
-curl -L https://github.com/steipete/goplaces/releases/download/v0.2.1/goplaces_0.2.1_linux_amd64.tar.gz | sha256sum
+dcp exec openclaw-gateway id
 ```
 
-Then bake them into the Dockerfile:
+Minimus images run as non-root by default. If `id` shows `uid=0(root)`, pin a non-root user explicitly via `user: "1000:1000"` in `docker-compose.prod.yml`.
 
-```dockerfile
-ARG GOG_SHA256=<paste-from-above>
-ARG GOPLACES_SHA256=<paste-from-above>
+### 11b. Read-only root filesystem
 
-RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
+`docker-compose.prod.yml` ships with `read_only: true` and `tmpfs` commented out (a known footgun until you've confirmed startup works). To enable:
 
-RUN curl -fsSL -o /tmp/gog.tar.gz https://github.com/steipete/gogcli/releases/download/v0.9.0/gogcli_0.9.0_linux_amd64.tar.gz \
-  && echo "${GOG_SHA256}  /tmp/gog.tar.gz" | sha256sum -c - \
-  && tar -xzf /tmp/gog.tar.gz -C /usr/local/bin && chmod +x /usr/local/bin/gog && rm /tmp/gog.tar.gz
-
-RUN curl -fsSL -o /tmp/goplaces.tar.gz https://github.com/steipete/goplaces/releases/download/v0.2.1/goplaces_0.2.1_linux_amd64.tar.gz \
-  && echo "${GOPLACES_SHA256}  /tmp/goplaces.tar.gz" | sha256sum -c - \
-  && tar -xzf /tmp/goplaces.tar.gz -C /usr/local/bin && chmod +x /usr/local/bin/goplaces && rm /tmp/goplaces.tar.gz
+```bash
+nano docker-compose.prod.yml   # uncomment the read_only + tmpfs block
+dcp up -d --force-recreate openclaw-gateway
+dcp logs -f openclaw-gateway
 ```
 
-Build will fail loudly if the upstream tarball ever changes.
+If startup fails, comment them out again and re-test.
 
-### 11d. Resource limits
+### 11c. Refresh the Minimus base digest
 
-Stops a runaway container from taking down the host:
+The base in `Dockerfile.minimus` is pinned to a multi-arch manifest digest. To update:
 
-```yaml
-    deploy:
-      resources:
-        limits:
-          cpus: "1.5"
-          memory: 1500M
+```bash
+docker buildx imagetools inspect us-docker.pkg.dev/prod-375107/minimus-public/openclaw:latest
 ```
 
-(Compose v2 honors `deploy.resources.limits` outside Swarm mode.)
+Replace the `@sha256:...` in `Dockerfile.minimus` with the top-level `Digest:`. Commit, push, redeploy.
 
-### 11e. Caveat: `docker` group on the host is root-equivalent
+### 11d. Move secrets off-disk
 
-`sudo usermod -aG docker $USER` (section 2) means anyone who gets a shell as `ubuntu` can mount `/` into a container and become host-root. The container hardening above doesn't change that. Mitigations: keep the SSH security group locked to your IP, use SSH key auth only (default on the AMI), and don't share the key.
+`.env` on the EC2 box is fine for solo / small-team use. For real internal-prod, move `OPENCLAW_GATEWAY_TOKEN` and `GOG_KEYRING_PASSWORD` to AWS Secrets Manager or SSM Parameter Store and inject at container start (via an entrypoint wrapper or `docker run --env-file=<(aws ssm get-parameter ...)`).
+
+### 11e. Auth proxy in front of the gateway
+
+The gateway token is a shared secret. SSH-tunnel-per-user doesn't scale to "several internal users." For multi-user prod, put one of these in front of the gateway: Cloudflare Access, Tailscale + ACLs, or an ALB with Okta/SAML. This is the highest-leverage security change once user count grows past 2–3.
+
+### 11f. Caveat: `docker` group is root-equivalent
+
+`sudo usermod -aG docker $USER` (section 2) means anyone with shell as `ubuntu` can mount `/` into a container and become host-root. Container hardening doesn't change this. Mitigations: keep the SSH security group locked to your IP, use SSH key auth only (default on the AMI), don't share the key, and rotate it if it leaks.
 
 ---
 

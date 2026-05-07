@@ -16,18 +16,18 @@ Get a key from [aistudio.google.com](https://aistudio.google.com/app/apikey). Si
 Add to `.env` on the VM:
 
 ```bash
-nano ~/openclaw/.env
+nano ~/ea-openclaw/.env
 ```
 
 ```
 GEMINI_API_KEY=<your-key>
 ```
 
-Then restart:
+Then restart (the `dcp` alias from walkthrough 02 expands to the `-f` flags):
 
 ```bash
-cd ~/openclaw
-docker compose up -d
+cd ~/ea-openclaw
+dcp up -d
 ```
 
 Set default model (inside the VM or via Control UI):
@@ -82,7 +82,7 @@ ssh -i keys/open-claw.pem ubuntu@<EC2_PUBLIC_DNS> 'chmod 600 ~/ea-agent-sa.json'
 
 ### 3. Mount into the container
 
-Edit `~/openclaw/docker-compose.override.yml` on the VM and add to the `openclaw-gateway` service:
+Edit `~/ea-openclaw/docker-compose.prod.yml` on the VM and extend the `openclaw-gateway` service with the volume + env:
 
 ```yaml
     volumes:
@@ -93,10 +93,16 @@ Edit `~/openclaw/docker-compose.override.yml` on the VM and add to the `openclaw
       GOOGLE_CLOUD_REGION: us-central1
 ```
 
+If the SA path is host-specific and you don't want to commit it to the fork, mark the file unchanged after the edit:
+
+```bash
+git update-index --skip-worktree docker-compose.prod.yml
+```
+
 Restart:
 
 ```bash
-docker compose up -d
+dcp up -d
 ```
 
 ### 4. Set default model

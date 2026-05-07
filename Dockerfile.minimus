@@ -1,0 +1,46 @@
+# OpenClaw deploy image — layers skill binaries onto Minimus's hardened
+# distroless OpenClaw base (~7 CVEs vs ~2,000 in the official image).
+#
+# Build:
+#   docker build -f Dockerfile.minimus -t openclaw:local .
+#
+# Or via docker-compose.prod.yml (auto-selected by `-f` flag).
+#
+# Skill binary checksums are baked in below as ARG defaults. To upgrade a
+# binary version, bump the URL and recompute the SHA:
+#   curl -fsSL <url> | shasum -a 256
+
+# ---- Stage 1: fetch + verify skill binaries ----
+FROM debian:12-slim AS skills
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Baked-in checksums for pinned binary versions. These are public, immutable
+# facts — override only if upgrading the binary version above.
+ARG GOG_SHA256=245598cb31e0072b5372ead2037ee89f2b65c7409423102814d885f2ba1b45c2
+ARG GOPLACES_SHA256=68274cfd7515b4fdacc1ce8a7ab052f75a2a8f7a2f9344f8e8591acb3a1a842a
+
+RUN test -n "$GOG_SHA256" && test -n "$GOPLACES_SHA256"
+
+RUN curl -fsSL -o /tmp/gog.tar.gz \
+      https://github.com/steipete/gogcli/releases/download/v0.9.0/gogcli_0.9.0_linux_amd64.tar.gz \
+ && echo "${GOG_SHA256}  /tmp/gog.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/gog.tar.gz -C /usr/local/bin \
+ && chmod +x /usr/local/bin/gog
+
+RUN curl -fsSL -o /tmp/goplaces.tar.gz \
+      https://github.com/steipete/goplaces/releases/download/v0.2.1/goplaces_0.2.1_linux_amd64.tar.gz \
+ && echo "${GOPLACES_SHA256}  /tmp/goplaces.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/goplaces.tar.gz -C /usr/local/bin \
+ && chmod +x /usr/local/bin/goplaces
+
+# ---- Stage 2: Minimus hardened OpenClaw + skills ----
+# Pinned to multi-arch manifest digest (covers both linux/amd64 and linux/arm64).
+# To refresh, re-inspect upstream:
+#   docker buildx imagetools inspect us-docker.pkg.dev/prod-375107/minimus-public/openclaw:latest
+FROM us-docker.pkg.dev/prod-375107/minimus-public/openclaw@sha256:9c8e8a6c79ce0e92c7cccfdd514b55f9a3066acae7524e928c939259bade71ab
+
+COPY --from=skills /usr/local/bin/gog      /usr/local/bin/gog
+COPY --from=skills /usr/local/bin/goplaces /usr/local/bin/goplaces

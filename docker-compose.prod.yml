@@ -1,0 +1,39 @@
+# docker-compose.prod.yml
+# Hardens for internal-prod deployment + builds from Dockerfile.minimus
+# (Minimus distroless OpenClaw + skill binaries).
+#
+# Invoke explicitly (Compose does NOT auto-merge this name):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Tip: alias it on EC2 — `alias dcp='docker compose -f docker-compose.yml -f docker-compose.prod.yml'`
+#
+# Requires Docker Compose v2.20+ for the `!override` list-replace tags.
+
+services:
+  openclaw-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.minimus
+    environment:
+      GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD:-}
+      XDG_CONFIG_HOME: /home/node/.openclaw
+    # Loopback-only. Gateway is reached over SSH tunnel; never bind to 0.0.0.0
+    # (which is what the base compose does by default).
+    ports: !override
+      - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+      - "127.0.0.1:${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+    # Base drops NET_RAW + NET_ADMIN; we drop everything.
+    cap_drop: !override
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1500M
+    # Read-only root FS with writable scratch. Enable after first successful
+    # boot — if startup fails, comment these out and re-test, then add caps
+    # back one at a time only as needed.
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
+    #   - /run

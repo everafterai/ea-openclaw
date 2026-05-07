@@ -78,9 +78,9 @@ aws ec2 run-instances \
 ```
 
 **Instance types:**
-- `t3.small` — 2 vCPU, 2GB RAM (~$15/mo)
-- `t3.micro` — 2 vCPU, 1GB RAM (free tier eligible)
-- `t3.medium` — 2 vCPU, 4GB RAM (~$30/mo, smoother for `pnpm install`)
+- `t3.small` — 2 vCPU, 2GB RAM (~$15/mo, plenty for the Minimus image flow — no source build)
+- `t3.micro` — 2 vCPU, 1GB RAM (free tier eligible; tight, but works)
+- `t3.medium` — 2 vCPU, 4GB RAM (~$30/mo; recommended once multiple internal users hit the gateway)
 
 Get the public DNS:
 
