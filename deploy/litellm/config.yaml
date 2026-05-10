@@ -1,0 +1,43 @@
+# LiteLLM proxy config — Vertex AI Gemini models.
+#
+# Loaded by the `litellm` service in docker-compose.prod.yml. The proxy uses
+# its own Python google-auth stack to authenticate to Vertex via the SA JSON
+# mounted at $GOOGLE_APPLICATION_CREDENTIALS, so we sidestep the gaxios
+# dynamic-fetch crash in OpenClaw's bundled google-auth-library.
+#
+# To add a model, append an entry to `model_list`. `model_name` is the alias
+# OpenClaw will reference (`litellm/<alias>`); `litellm_params.model` is the
+# Vertex resource name (`vertex_ai/<model-id>`).
+#
+# Available Vertex Gemini models (verify in GCP console; availability shifts):
+#   vertex_ai/gemini-2.5-pro
+#   vertex_ai/gemini-2.5-flash
+#   vertex_ai/gemini-2.0-flash
+#   vertex_ai/gemini-1.5-pro
+#   vertex_ai/gemini-1.5-flash
+
+model_list:
+  - model_name: gemini-2.5-pro
+    litellm_params:
+      model: vertex_ai/gemini-2.5-pro
+      vertex_project: os.environ/GOOGLE_CLOUD_PROJECT
+      vertex_location: os.environ/GOOGLE_CLOUD_LOCATION
+
+  - model_name: gemini-2.5-flash
+    litellm_params:
+      model: vertex_ai/gemini-2.5-flash
+      vertex_project: os.environ/GOOGLE_CLOUD_PROJECT
+      vertex_location: os.environ/GOOGLE_CLOUD_LOCATION
+
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: vertex_ai/gemini-2.0-flash
+      vertex_project: os.environ/GOOGLE_CLOUD_PROJECT
+      vertex_location: os.environ/GOOGLE_CLOUD_LOCATION
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -6,6 +6,13 @@
 # is non-negotiable until Minimus rolls back. Acceptable here because the
 # gateway runs in a gated AWS VPC reachable only via SSH tunnel.
 #
+# Vertex AI is reached through a self-hosted LiteLLM sidecar (see `litellm`
+# service below). OpenClaw's bundled `gaxios` 7.1.4 + google-auth-library
+# combo crashes Node's CJS->ESM translator on the dynamic fetch import (GH
+# issue openclaw/openclaw#9729). LiteLLM has its own (Python) Vertex auth
+# stack, so we route OpenClaw -> LiteLLM (HTTP, OpenAI-compatible) ->
+# Vertex. LiteLLM is run from the OSS image; no third-party data path.
+#
 # Invoke explicitly (Compose does NOT auto-merge this name):
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 #
@@ -19,17 +26,16 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - /home/ubuntu/ea-agent-sa.json:/run/secrets/gcp-sa.json:ro
       # Workspace-authored skills land in this repo dir so they can be
       # `git add`ed and pushed. Bundled skills (image-baked) stay under
       # `skills/`; agent-authored skills go here.
       - /home/ubuntu/ea-openclaw/workspace-skills:/home/node/.openclaw/workspace/skills
     environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
-      GOOGLE_CLOUD_PROJECT: everafter-19954
-      GOOGLE_CLOUD_LOCATION: global
       GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD:-}
       XDG_CONFIG_HOME: /home/node/.openclaw
+    depends_on:
+      litellm:
+        condition: service_healthy
     # Loopback-only. Gateway is reached over SSH tunnel; never bind to 0.0.0.0
     # (which is what the base compose does by default).
     ports: !override
@@ -63,3 +69,51 @@ services:
     # tmpfs:
     #   - /tmp
     #   - /run
+
+  # ----------------------------------------------------------------------
+  # LiteLLM proxy — translates OpenAI-compatible HTTP into Vertex AI calls
+  # using its own (Python) google-auth stack. Internal-only: no host port
+  # binding; openclaw-gateway reaches it at http://litellm:4000 via the
+  # default compose network. Self-hosted from upstream OSS image; no data
+  # leaves the VPC except through the existing Vertex subprocessor path.
+  # ----------------------------------------------------------------------
+  litellm:
+    # Pin to a specific tag for reproducibility. Bump deliberately; do NOT
+    # use a moving tag like `latest`. Check releases:
+    #   https://github.com/BerriAI/litellm/releases
+    image: ghcr.io/berriai/litellm:main-stable
+    volumes:
+      - /home/ubuntu/ea-agent-sa.json:/run/secrets/gcp-sa.json:ro
+      - ./deploy/litellm/config.yaml:/etc/litellm/config.yaml:ro
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
+      GOOGLE_CLOUD_PROJECT: ${GCP_PROJECT_ID:-everafter-19954}
+      GOOGLE_CLOUD_LOCATION: ${GCP_LOCATION:-us-central1}
+      # Master key OpenClaw will use to call LiteLLM. Generate once and keep
+      # in `.env` (never commit). On EC2:
+      #   echo "LITELLM_MASTER_KEY=sk-$(openssl rand -hex 24)" >> .env
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in .env}
+    command:
+      - "--config"
+      - "/etc/litellm/config.yaml"
+      - "--port"
+      - "4000"
+      - "--num_workers"
+      - "1"
+    # Internal-only — never expose 4000 on the host.
+    expose:
+      - "4000"
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
