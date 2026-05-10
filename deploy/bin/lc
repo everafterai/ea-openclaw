@@ -62,10 +62,53 @@ http_get() {
   local path="$1"; shift || true
   load_key
   ensure_running
-  docker exec "$CONTAINER" curl -fsS \
-    -H "Authorization: Bearer $KEY" \
-    "http://127.0.0.1:4000$path" "$@"
-  echo
+  # The litellm image is python-only (no curl). Use urllib instead.
+  docker exec -e LC_KEY="$KEY" -e LC_PATH="$path" "$CONTAINER" python -c '
+import os, sys, urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:4000" + os.environ["LC_PATH"],
+    headers={"Authorization": "Bearer " + os.environ["LC_KEY"]},
+)
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        sys.stdout.write(r.read().decode("utf-8", "replace"))
+        sys.stdout.write("\n")
+except urllib.error.HTTPError as e:
+    sys.stderr.write(f"HTTP {e.code} {e.reason}\n")
+    sys.stderr.write(e.read().decode("utf-8", "replace") + "\n")
+    sys.exit(1)
+except Exception as e:
+    sys.stderr.write(f"error: {e}\n"); sys.exit(1)
+'
+}
+
+http_post_json() {
+  local path="$1"; shift
+  local body="$1"; shift
+  load_key
+  ensure_running
+  docker exec -e LC_KEY="$KEY" -e LC_PATH="$path" -e LC_BODY="$body" "$CONTAINER" python -c '
+import os, sys, urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:4000" + os.environ["LC_PATH"],
+    data=os.environ["LC_BODY"].encode("utf-8"),
+    headers={
+        "Authorization": "Bearer " + os.environ["LC_KEY"],
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=120) as r:
+        sys.stdout.write(r.read().decode("utf-8", "replace"))
+        sys.stdout.write("\n")
+except urllib.error.HTTPError as e:
+    sys.stderr.write(f"HTTP {e.code} {e.reason}\n")
+    sys.stderr.write(e.read().decode("utf-8", "replace") + "\n")
+    sys.exit(1)
+except Exception as e:
+    sys.stderr.write(f"error: {e}\n"); sys.exit(1)
+'
 }
 
 # --- subcommands ---
@@ -107,14 +150,12 @@ case "$cmd" in
       echo "Usage: lc test <model> [message]" >&2
       exit 2
     fi
-    load_key
-    ensure_running
-    docker exec "$CONTAINER" curl -fsS \
-      -H "Authorization: Bearer $KEY" \
-      -H "Content-Type: application/json" \
-      -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"$msg\"}]}" \
-      http://127.0.0.1:4000/v1/chat/completions \
-      | python3 -m json.tool 2>/dev/null || true
+    # JSON-encode model + msg via python (handles quotes/unicode safely)
+    body=$(python3 -c '
+import json, sys
+print(json.dumps({"model": sys.argv[1], "messages": [{"role": "user", "content": sys.argv[2]}]}))
+' "$model" "$msg")
+    http_post_json /v1/chat/completions "$body" | python3 -m json.tool 2>/dev/null || true
     ;;
   curl)
     path="${1:-/}"; shift || true
