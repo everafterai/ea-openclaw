@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# lc — LiteLLM control shim for the dockerized litellm sidecar.
+#
+# Usage:
+#   lc                     # status (alias for `lc ps`)
+#   lc ps                  # container status
+#   lc logs [args...]      # follow logs (passes args to `docker logs`)
+#   lc restart             # restart the litellm container
+#   lc edit                # edit deploy/litellm/config.yaml then restart
+#   lc reload              # restart only (after manual config edit)
+#   lc shell               # open a shell inside the container
+#
+# HTTP helpers (auto-inject the master key from .env):
+#   lc health              # GET /health/liveliness
+#   lc ready               # GET /health/readiness
+#   lc models              # GET /v1/models
+#   lc spend               # GET /spend
+#   lc test <model> [msg]  # POST /v1/chat/completions (default msg: "Hello")
+#   lc curl <path> [args]  # arbitrary authenticated GET against the proxy
+#
+# Raw passthrough:
+#   lc exec <cmd...>       # docker exec into the litellm container
+#   lc cli <litellm-args>  # run `litellm` CLI inside the container
+#
+# Requires:
+#   - docker on PATH
+#   - run from anywhere; resolves repo root from script location
+#   - .env in the repo root with LITELLM_MASTER_KEY=...
+
+set -euo pipefail
+
+# --- locate repo + container ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONTAINER="${LITELLM_CONTAINER:-ea-openclaw-litellm-1}"
+CONFIG_FILE="$REPO_DIR/deploy/litellm/config.yaml"
+ENV_FILE="$REPO_DIR/.env"
+
+# --- load master key from .env (no value leaks to logs) ---
+load_key() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "lc: .env not found at $ENV_FILE" >&2
+    exit 1
+  fi
+  KEY="$(grep -E '^LITELLM_MASTER_KEY=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
+  if [[ -z "${KEY:-}" ]]; then
+    echo "lc: LITELLM_MASTER_KEY not set in $ENV_FILE" >&2
+    exit 1
+  fi
+}
+
+# --- helpers ---
+ensure_running() {
+  if ! docker inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null | grep -qx running; then
+    echo "lc: container '$CONTAINER' is not running" >&2
+    docker ps -a --filter "name=$CONTAINER" || true
+    exit 1
+  fi
+}
+
+http_get() {
+  local path="$1"; shift || true
+  load_key
+  ensure_running
+  docker exec "$CONTAINER" curl -fsS \
+    -H "Authorization: Bearer $KEY" \
+    "http://127.0.0.1:4000$path" "$@"
+  echo
+}
+
+# --- subcommands ---
+cmd="${1:-ps}"
+shift || true
+
+case "$cmd" in
+  ps|status)
+    docker ps --filter "name=$CONTAINER"
+    ;;
+  logs)
+    exec docker logs "$@" "$CONTAINER"
+    ;;
+  restart|reload)
+    docker restart "$CONTAINER"
+    ;;
+  edit)
+    "${EDITOR:-nano}" "$CONFIG_FILE"
+    echo "Restarting litellm to pick up config..."
+    docker restart "$CONTAINER"
+    ;;
+  shell|sh)
+    ensure_running
+    exec docker exec -it "$CONTAINER" sh
+    ;;
+  health)
+    http_get /health/liveliness ;;
+  ready|readiness)
+    http_get /health/readiness ;;
+  models)
+    http_get /v1/models | python3 -m json.tool 2>/dev/null || true
+    ;;
+  spend)
+    http_get /spend ;;
+  test)
+    model="${1:-}"; shift || true
+    msg="${*:-Hello — what model are you?}"
+    if [[ -z "$model" ]]; then
+      echo "Usage: lc test <model> [message]" >&2
+      exit 2
+    fi
+    load_key
+    ensure_running
+    docker exec "$CONTAINER" curl -fsS \
+      -H "Authorization: Bearer $KEY" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"$msg\"}]}" \
+      http://127.0.0.1:4000/v1/chat/completions \
+      | python3 -m json.tool 2>/dev/null || true
+    ;;
+  curl)
+    path="${1:-/}"; shift || true
+    http_get "$path" "$@"
+    ;;
+  exec)
+    ensure_running
+    exec docker exec -it "$CONTAINER" "$@"
+    ;;
+  cli)
+    ensure_running
+    exec docker exec -it "$CONTAINER" litellm "$@"
+    ;;
+  -h|--help|help)
+    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "lc: unknown command '$cmd' (try: lc help)" >&2
+    exit 2
+    ;;
+esac
