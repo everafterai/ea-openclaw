@@ -9,7 +9,7 @@ Key:   keys/open-claw.pem
 ```
 
 ```bash
-ssh -i keys/open-claw.pem ubuntu@ec2-35-175-147-1.compute-1.amazonaws.com
+ssh -A -i keys/open-claw.pem ubuntu@ec2-35-175-147-1.compute-1.amazonaws.com
 ```
 
 Run from the project root so the relative key path resolves. `keys/` is gitignored.

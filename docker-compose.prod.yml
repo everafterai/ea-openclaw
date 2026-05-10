@@ -1,6 +1,10 @@
 # docker-compose.prod.yml
-# Hardens for internal-prod deployment + builds from Dockerfile.minimus
-# (Minimus distroless OpenClaw + skill binaries).
+# Hardens for internal-prod deployment + builds from the standard Dockerfile
+# (node:24-bookworm-slim base). Minimus distroless was tried first but its
+# `latest` tag ships Node 25, which has an ESM/CJS translator regression that
+# breaks google-auth-library (gaxios dynamic fetch import). Sticking to Node 24
+# is non-negotiable until Minimus rolls back. Acceptable here because the
+# gateway runs in a gated AWS VPC reachable only via SSH tunnel.
 #
 # Invoke explicitly (Compose does NOT auto-merge this name):
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
@@ -13,8 +17,17 @@ services:
   openclaw-gateway:
     build:
       context: .
-      dockerfile: Dockerfile.minimus
+      dockerfile: Dockerfile
+    volumes:
+      - /home/ubuntu/ea-agent-sa.json:/run/secrets/gcp-sa.json:ro
+      # Workspace-authored skills land in this repo dir so they can be
+      # `git add`ed and pushed. Bundled skills (image-baked) stay under
+      # `skills/`; agent-authored skills go here.
+      - /home/ubuntu/ea-openclaw/workspace-skills:/home/node/.openclaw/workspace/skills
     environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-sa.json
+      GOOGLE_CLOUD_PROJECT: everafter-19954
+      GOOGLE_CLOUD_LOCATION: global
       GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD:-}
       XDG_CONFIG_HOME: /home/node/.openclaw
     # Loopback-only. Gateway is reached over SSH tunnel; never bind to 0.0.0.0
@@ -25,6 +38,19 @@ services:
     # Base drops NET_RAW + NET_ADMIN; we drop everything.
     cap_drop: !override
       - ALL
+    # First-boot: --allow-unconfigured lets the gateway start without a
+    # config.yaml so you can finish setup via the Control UI in the browser.
+    # Remove once you've persisted a config to ~/.openclaw/config.yaml and
+    # want strict-config behavior back.
+    command: !override
+      - "node"
+      - "dist/index.js"
+      - "gateway"
+      - "--bind"
+      - "${OPENCLAW_GATEWAY_BIND:-lan}"
+      - "--port"
+      - "18789"
+      - "--allow-unconfigured"
     deploy:
       resources:
         limits:

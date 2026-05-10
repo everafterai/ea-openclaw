@@ -113,6 +113,35 @@ source ~/.zshrc
 
 (Use `~/.bashrc` if you skipped section 2a.)
 
+## 6a. `openclaw` CLI shim (recommended)
+
+OpenClaw docs throughout reference commands like `openclaw agents list`, `openclaw onboard`, `openclaw plugins enable …`. That `openclaw` binary is the native CLI — installed via `npm i -g openclaw`, the macOS installer, etc. Your EC2 install is fully containerized; the binary lives **inside the image**, not on the host PATH, so docs commands don't work as-is.
+
+Drop a shim script that wraps the running gateway container with `docker compose exec`. Same image as the cli sidecar, but no per-invocation container spin-up — `exec` runs the command **inside the already-running gateway**, which is essentially instant:
+
+```bash
+sudo tee /usr/local/bin/openclaw >/dev/null <<'EOF'
+#!/usr/bin/env bash
+exec docker compose -f ~/ea-openclaw/docker-compose.yml -f ~/ea-openclaw/docker-compose.prod.yml exec openclaw-gateway node dist/index.js "$@"
+EOF
+sudo chmod +x /usr/local/bin/openclaw
+```
+
+Now `openclaw agents list`, `openclaw models set …`, `openclaw plugins enable …` all work, routed transparently into the running gateway. Won't be functional until §7 builds + starts the gateway, but the script itself is fine to lay down now.
+
+**For bootstrap commands** that must run *without* a healthy gateway (`openclaw setup`, recovery commands when the gateway is in a restart loop), use `dcp run --rm openclaw-cli <cmd>` instead — it spins up a fresh container that mounts the same volumes but doesn't depend on the gateway being up. The `dcp run` form costs ~1-2s per call (container create/destroy), so reserve it for bootstrap; for everyday CLI use, `exec` via the shim is faster.
+
+If you'd rather skip `sudo`, an alias does the same job for your shell only:
+
+```bash
+echo "alias openclaw='dcp exec openclaw-gateway node dist/index.js'" >> ~/.zshrc
+source ~/.zshrc
+```
+
+(Aliases occasionally trip on quoted args; the script handles those cleanly.)
+
+**Footgun.** The `openclaw` you'd type on your **laptop** (if you've installed it natively) is a different binary pointing at *your laptop's* `~/.openclaw` — a separate gateway with separate config. The shim above only resolves on EC2 against the deployed gateway's config volume. Don't conflate them: to manage the deployed gateway, always run commands on the EC2 box (or `ssh ec2-claw 'openclaw agents list'` from your laptop).
+
 ## 7. Build and run
 
 ```bash
