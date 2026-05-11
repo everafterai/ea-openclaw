@@ -131,37 +131,37 @@ cmd_init() {
     "viewers":   { "type": "message.senders", "members": { "slack": [] } }
   },
   "agents": {
-    "default": "base-view",
     "list": [
       {
         "id": "base-admin",
-        "workspace": "/home/ubuntu/.openclaw/workspace-admin",
+        "workspace": "~/.openclaw/workspace-admin",
         "sandbox": { "mode": "off" },
         "tools": {
-          "allow": ["read","write","edit","exec","apply_patch","browser","sessions_send","memory"],
+          "allow": ["read","write","edit","exec","apply_patch","browser","sessions_send","group:memory"],
           "elevated": { "enabled": true }
         },
-        "systemPrompt": "base-admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup."
+        "systemPromptOverride": "base-admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup."
       },
       {
         "id": "base-ops",
-        "workspace": "/home/ubuntu/.openclaw/workspace-ops",
+        "workspace": "~/.openclaw/workspace-ops",
         "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "rw" },
         "tools": {
-          "allow": ["read","write","edit","browser","sessions_send","memory"],
+          "allow": ["read","write","edit","browser","sessions_send","group:memory"],
           "deny":  ["exec","apply_patch","gateway","cron"]
         },
-        "systemPrompt": "base-ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config."
+        "systemPromptOverride": "base-ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config."
       },
       {
         "id": "base-view",
-        "workspace": "/home/ubuntu/.openclaw/workspace-view",
+        "default": true,
+        "workspace": "~/.openclaw/workspace-view",
         "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "ro" },
         "tools": {
-          "allow": ["read","browser","memory"],
+          "allow": ["read","browser","group:memory"],
           "deny":  ["write","edit","exec","apply_patch","sessions_send","gateway","cron"]
         },
-        "systemPrompt": "base-view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead."
+        "systemPromptOverride": "base-view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead."
       }
     ]
   },
@@ -175,8 +175,8 @@ cmd_init() {
   "channels": {
     "slack": {
       "mode": "socket",
-      "botToken":  { "secret": "SLACK_BOT_TOKEN" },
-      "appToken":  { "secret": "SLACK_APP_TOKEN" },
+      "botToken":  { "source": "env", "provider": "default", "id": "SLACK_BOT_TOKEN" },
+      "appToken":  { "source": "env", "provider": "default", "id": "SLACK_APP_TOKEN" },
       "dmPolicy":  "allowlist",
       "allowFrom": ["accessGroup:admins", "accessGroup:operators", "accessGroup:viewers"],
       "dm":          { "enabled": true, "groupEnabled": false },
@@ -193,31 +193,25 @@ cmd_init() {
       "allowBots": false,
       "channels": {
         "REPLACE_WITH_ADMIN_CHANNEL_ID": {
-          "allow": true,
-          "users": ["accessGroup:admins"],
+          "enabled": true,
           "requireMention": true,
           "systemPrompt": "You are in #base-ai-admin. Treat senders as admin tier. Audit every exec."
         },
         "REPLACE_WITH_OPS_CHANNEL_ID": {
-          "allow": true,
-          "users": ["accessGroup:admins", "accessGroup:operators"],
+          "enabled": true,
           "requireMention": true,
           "systemPrompt": "You are in #base-ai-ops. No exec, no apply_patch — refuse and suggest DMing an admin."
         },
         "REPLACE_WITH_ASK_CHANNEL_ID": {
-          "allow": true,
-          "users": ["accessGroup:admins", "accessGroup:operators", "accessGroup:viewers"],
+          "enabled": true,
           "requireMention": true,
           "systemPrompt": "You are in #base-ai-ask. Read-only Q&A only. Refuse write requests and link to #base-ai-ops."
         }
       },
       "execApprovals": {
-        "enabled": "auto",
         "approvers": ["accessGroup:admins"],
         "target": "dm"
       },
-      "streaming": { "mode": "partial" },
-      "chunkMode": "newline",
       "ackReaction": "eyes",
       "typingReaction": "hourglass_flowing_sand"
     }
@@ -226,7 +220,7 @@ cmd_init() {
     "ownerAllowFrom": [],
     "useAccessGroups": true,
     "ownerDisplay": "hash",
-    "ownerDisplaySecret": { "secret": "OWNER_DISPLAY_HMAC_KEY" }
+    "ownerDisplaySecret": "REPLACE_WITH_OWNER_DISPLAY_HMAC_KEY"
   }
 }
 JSON

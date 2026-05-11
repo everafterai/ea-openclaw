@@ -230,41 +230,44 @@ channels: {
     allowBots: false,                  // never react to other bots (loop prevention)
 
     // ---- Per-channel overrides ----
+    // Note: the per-channel `users:` allowlist is omitted intentionally.
+    // The slack channel gate (extensions/slack/.../prepare.ts:471 →
+    // src/channels/allowlist-match.ts:35) does NOT expand `accessGroup:`
+    // references — it matches literal Slack user IDs only. Putting
+    // `accessGroup:admins` here would silently reject everyone.
+    // Tier separation is enforced two ways instead:
+    //   1. Slack private-channel membership (Slack-side ACL)
+    //   2. The global channels.slack.allowFrom above (this DOES expand
+    //      accessGroup:) — gates whether the bot listens at all
+    //   3. The channel binding (above) — routes to the right tier agent
+    // If you ever want defense-in-depth here, populate `users:` with literal
+    // Slack user IDs and keep them in sync with accessGroups manually.
     channels: {
-      // Admin-tier channel
       C_ADMIN_CHAN: {
-        allow: true,
-        users: ["accessGroup:admins"],
+        enabled: true,
         requireMention: true,
-        skills: ["*"],                 // optional skill filter; "*" = all
         systemPrompt: "You are in #base-ai-admin. Treat senders as admin tier. Audit every exec.",
       },
-      // Operator-tier channel
       C_OPS_CHAN: {
-        allow: true,
-        users: ["accessGroup:admins", "accessGroup:operators"],
+        enabled: true,
         requireMention: true,
         systemPrompt: "You are in #base-ai-ops. No exec, no apply_patch — refuse and suggest DMing an admin.",
       },
-      // Viewer-tier channel
       C_ASK_CHAN: {
-        allow: true,
-        users: ["accessGroup:admins", "accessGroup:operators", "accessGroup:viewers"],
+        enabled: true,
         requireMention: true,
         systemPrompt: "You are in #base-ai-ask. Read-only Q&A only. Refuse write requests and link to #base-ai-ops.",
       },
     },
 
     // ---- Native exec approvals (Slack-button UX) ----
+    // Don't set `enabled` — the zod schema only accepts boolean, and the
+    // default is "auto" (DM-first when approvers resolve). Including
+    // `enabled: "auto"` will fail validation.
     execApprovals: {
-      enabled: "auto",
       approvers: ["accessGroup:admins"],   // any admin can approve any exec
       target: "dm",                         // approval card DM'd to all admins
     },
-
-    // ---- Streaming / display ----
-    streaming: { mode: "partial" },
-    chunkMode: "newline",
 
     // ---- Reactions (visible feedback) ----
     ackReaction: "eyes",
@@ -272,6 +275,8 @@ channels: {
   },
 }
 ```
+
+**SecretRef shape.** `botToken` / `appToken` accept either a literal string or a SecretRef of the form `{ "source": "env" | "file" | "exec", "provider": "default", "id": "ENV_VAR_NAME" }`. The skeleton uses the env-var form; replace with literals only if you're not using OpenClaw's secrets keyring.
 
 ### `commands` (slash-command and owner gating)
 
@@ -408,9 +413,9 @@ To run commands on the EC2, either SSH in interactively (`ssh -i keys/open-claw.
 ### Adding a new tier-channel
 
 1. Create private Slack channel, invite the right accessGroup members + `@base-ai`.
-2. Add `channels.slack.channels.<new_id>` block with the right `users:`, `requireMention:`, and (optional) channel-specific `systemPrompt:`.
+2. Add `channels.slack.channels.<new_id>` block with `enabled: true`, `requireMention: true`, and (optional) channel-specific `systemPrompt:`. Do **not** add a `users:` allowlist with `accessGroup:` refs — the slack channel gate doesn't expand them. Tier access is enforced by Slack channel membership + global `allowFrom`.
 3. Add a `bindings` entry pointing to the right agent.
-4. Reload.
+4. `bai reload`.
 
 ### Bot got invited to a channel it shouldn't be in
 
@@ -442,7 +447,6 @@ Five phases, each ending with verifiable proof before moving on.
 - Add `accessGroups.operators` and `accessGroups.admins` with real members.
 - Add `agents.list[base-ops]` and `agents.list[base-admin]`.
 - Add the channel bindings and per-user DM bindings.
-- Add per-channel `users:` allowlists.
 - Verify (table-test):
   | Test | Expected |
   |---|---|
