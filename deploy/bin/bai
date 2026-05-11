@@ -35,7 +35,13 @@
 #                                  # to create workspace bootstrap files (7 .md
 #                                  # templates) + sessions dirs. Required after
 #                                  # bai migrate before the UI will show them.
-#   bai reload                     # validate, then reload the gateway
+#   bai reload                     # validate, then full docker restart of the
+#                                  # gateway. Slow (~10s) but reliable —
+#                                  # required after adding/removing agents.
+#   bai reload --hot               # validate, then `openclaw config reload`
+#                                  # (in-process). Fast, but does NOT re-init
+#                                  # new agents. Only use for routing/access
+#                                  # group/binding changes on existing agents.
 #   bai path                       # print path to the config file
 #   bai help                       # this help
 #
@@ -768,33 +774,40 @@ cmd_bootstrap() {
 
 # --- subcommand: reload ---
 #
-# Validates the local config, then asks the gateway to reload. Tries the
-# `openclaw config reload` shim first (zero-downtime when supported);
-# falls back to `docker compose restart openclaw-gateway` (brief downtime).
+# Validates the local config, then restarts the gateway container. We default
+# to a full `docker compose restart openclaw-gateway` because `openclaw config
+# reload` (the hot path) doesn't reliably re-initialize agent registrations
+# after agents.list changes — a learned-the-hard-way gotcha. The container
+# restart is ~10s of downtime and is what actually picks up new agents.
+#
+# Pass --hot to attempt the in-process config reload instead. Use that for
+# tier/binding/accessGroup changes that don't add or remove agents.
 cmd_reload() {
+  local mode="restart"
+  if [[ "${1:-}" == "--hot" ]]; then mode="hot"; shift; fi
+
   require_config
 
   echo "bai: validating before reload..."
   cmd_validate || die "validation failed — fix issues before reloading"
 
-  if command -v openclaw >/dev/null 2>&1; then
-    echo "bai: openclaw config reload"
-    if openclaw config reload; then
-      echo "bai: reload done"
-      return 0
-    fi
-    echo "bai: 'openclaw config reload' failed — falling back to container restart" >&2
+  if [[ "$mode" == "hot" ]]; then
+    command -v openclaw >/dev/null 2>&1 || die "the 'openclaw' shim is required for --hot reload"
+    echo "bai: openclaw config reload (hot — won't re-init new agents)"
+    openclaw config reload || die "hot reload failed; try 'bai reload' for a full restart"
+    echo "bai: hot-reload done"
+    return 0
   fi
 
   if [[ -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
     echo "bai: docker compose restart openclaw-gateway (in $COMPOSE_DIR)"
     (cd "$COMPOSE_DIR" && \
        docker compose -f docker-compose.yml -f docker-compose.prod.yml restart openclaw-gateway)
-    echo "bai: reload done"
+    echo "bai: reload done (gateway fully restarted)"
     return 0
   fi
 
-  die "no 'openclaw' shim and no docker-compose dir at $COMPOSE_DIR — reload manually"
+  die "no docker-compose dir at $COMPOSE_DIR — set BAI_COMPOSE_DIR or restart manually"
 }
 
 # --- subcommand: path ---

@@ -483,6 +483,16 @@ Five phases, each ending with verifiable proof before moving on.
 
 Reversal at any phase is `git revert` of the config change + config reload. No state migration required.
 
+## Gotchas (learned from bootstrap)
+
+- **Adding agents requires a full container restart, not `openclaw config reload`.** The in-process config reload picks up routing/binding/accessGroup changes for *existing* agents but doesn't re-initialize newly-added agents (or fully reset their workspace state). Use `bai reload` (default — `docker compose restart openclaw-gateway`) after any agents.list change. `bai reload --hot` is the faster in-process reload, but only safe when you haven't added or removed agents.
+- **Just writing an agent to `openclaw.json` isn't enough — you also need `openclaw agents add <id>` (or `bai bootstrap`).** That command runs `ensureWorkspaceAndSessions`, which creates the 7 workspace bootstrap files (`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`) and the per-agent sessions directory. The UI uses those files to populate the "Files" tab and seems to hide agents missing them.
+- **The UI dropdown shows agents the gateway has fully registered, not just configured.** After `bai migrate` + `bai bootstrap` + `bai reload`, the dropdown should expand to all four tiers. If only `main` appears, run `bai reload` again (full restart, not `--hot`).
+- **Workspace paths must use `~/.openclaw/...` (tilde-expanded inside the container), not `/home/ubuntu/.openclaw/...` (host path).** The container's home is `/home/node`; the bind-mount makes them resolve to the same place when the path is tilde-form.
+- **`commands.ownerDisplaySecret` is a plain string, not a SecretRef object.** The skeleton's `REPLACE_WITH_OWNER_DISPLAY_HMAC_KEY` is a literal placeholder — replace with `openssl rand -hex 32` output, or switch `ownerDisplay` to `"raw"` and drop the secret entirely (defensible for a small cooperative team where Slack IDs are already visible).
+- **`channels.slack.execApprovals.enabled: "auto"` fails zod validation** despite the docs suggesting it. The schema only accepts boolean. Omit the key (default is auto-on when approvers resolve) or set to `true`.
+- **Per-channel `users: ["accessGroup:admins"]` silently rejects everyone.** The slack channel gate doesn't expand `accessGroup:` refs — only literal Slack user IDs match. Tier separation in shared channels is enforced by Slack channel membership + the *global* `channels.slack.allowFrom` (which does expand accessGroups) + bindings. The per-channel `users:` allowlist is functionally inert with accessGroup refs.
+
 ## Open questions / decisions deferred
 
 1. ~~**Bot user display name**~~ — resolved: `@base-ai`.
