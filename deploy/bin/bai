@@ -31,6 +31,10 @@
 #                                  # shapes, drops invalid execApprovals.enabled,
 #                                  # rewrites tools "memory" → "group:memory",
 #                                  # strips accessGroup: from per-channel users)
+#   bai bootstrap                  # run `openclaw agents add` for admin/ops/view
+#                                  # to create workspace bootstrap files (7 .md
+#                                  # templates) + sessions dirs. Required after
+#                                  # bai migrate before the UI will show them.
 #   bai reload                     # validate, then reload the gateway
 #   bai path                       # print path to the config file
 #   bai help                       # this help
@@ -722,6 +726,46 @@ cmd_migrate() {
   echo "  4. openclaw gateway restart (or: bai reload)"
 }
 
+# --- subcommand: bootstrap ---
+#
+# Bootstraps the three tier agents (admin/ops/view) so they show up in the UI.
+# Just writing them to openclaw.json isn't enough — the UI requires the
+# workspace bootstrap files (AGENTS.md, SOUL.md, TOOLS.md, IDENTITY.md,
+# USER.md, HEARTBEAT.md, BOOTSTRAP.md) plus the sessions dir. The only
+# supported way to create these is `openclaw agents add` (which both writes
+# the config and runs ensureWorkspaceAndSessions).
+#
+# This command shells out to `openclaw agents add <id>` for each tier agent
+# already present in agents.list. The openclaw CLI sees the entry exists and
+# offers an interactive "Update it?" prompt — accept with 'y' and Enter
+# through the remaining defaults.
+#
+# Idempotent: bootstrap files survive re-runs; the openclaw CLI is smart
+# enough to not duplicate them.
+cmd_bootstrap() {
+  require_config
+  command -v openclaw >/dev/null 2>&1 || die "the 'openclaw' CLI must be on PATH (see walkthrough §6a)"
+
+  echo "bai: running 'openclaw agents add' interactively for each tier agent."
+  echo "     At each prompt:"
+  echo "       'Agent ... already exists. Update it?'  → answer y"
+  echo "       'Workspace directory'                   → press Enter (accept default)"
+  echo "       'Configure model/auth for this agent now?' → answer n"
+  echo "     (any other prompts: accept defaults / decline)"
+  echo
+  for agent in admin ops view; do
+    if ! jq -e --arg a "$agent" '.agents.list[] | select(.id == $a)' "$CONFIG_FILE" >/dev/null; then
+      echo "bai: $agent not in agents.list — run 'bai migrate' first"
+      continue
+    fi
+    echo "─── $agent ───"
+    openclaw agents add "$agent" || die "openclaw agents add $agent failed"
+    echo
+  done
+  echo "bai: bootstrap done. Restart the gateway to pick up the new workspace files:"
+  echo "     openclaw gateway restart"
+}
+
 # --- subcommand: reload ---
 #
 # Validates the local config, then asks the gateway to reload. Tries the
@@ -760,7 +804,7 @@ cmd_path() { echo "$CONFIG_FILE"; }
 # --- subcommand: help ---
 
 cmd_help() {
-  sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- dispatch ---
@@ -803,6 +847,7 @@ case "$cmd" in
   tiers)              cmd_tiers ;;
   validate|check)     cmd_validate ;;
   migrate)            cmd_migrate ;;
+  bootstrap)          cmd_bootstrap ;;
   reload)             cmd_reload ;;
   path)               cmd_path ;;
   -h|--help|help)     cmd_help ;;
