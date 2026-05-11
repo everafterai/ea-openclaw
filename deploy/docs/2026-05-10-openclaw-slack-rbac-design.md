@@ -45,13 +45,13 @@ Slack workspace (single)
 │   ├── #base-ai-ops     — Operator tier members
 │   └── #base-ai-ask     — Viewer tier members (general staff)
 ├── DMs to @base-ai:
-│   ├── from admin user-IDs    → base-admin agent
-│   └── from anyone else       → base-view agent
+│   ├── from admin user-IDs    → admin agent
+│   └── from anyone else       → view agent
 └── OpenClaw gateway (EC2)
     ├── Three agents in agents.list:
-    │   ├── base-admin   sandbox: off,           tools: full      workspace: ~/.openclaw/workspace-admin
-    │   ├── base-ops     sandbox: all/agent rw,  tools: workflow  workspace: ~/.openclaw/workspace-ops
-    │   └── base-view    sandbox: all/agent ro,  tools: read-only workspace: ~/.openclaw/workspace-view (read-only mount)
+    │   ├── admin   sandbox: off,           tools: full      workspace: ~/.openclaw/workspace-admin
+    │   ├── ops     sandbox: all/agent rw,  tools: workflow  workspace: ~/.openclaw/workspace-ops
+    │   └── view    sandbox: all/agent ro,  tools: read-only workspace: ~/.openclaw/workspace-view (read-only mount)
     └── accessGroups: { admins, operators, viewers }
 ```
 
@@ -117,40 +117,45 @@ To resolve a user ID without admin tools: in Slack, click a user's profile → `
 
 ```json5
 agents: {
+  // No top-level `default` key — OpenClaw's zod schema rejects it.
+  // Mark the default agent with `default: true` on its list entry instead.
   list: [
     {
-      id: "base-admin",
-      workspace: "/home/ubuntu/.openclaw/workspace-admin",
+      id: "admin",
+      workspace: "~/.openclaw/workspace-admin",  // tilde expands inside the container
       sandbox: { mode: "off" },
       tools: {
-        allow: ["read", "write", "edit", "exec", "apply_patch", "browser", "sessions_send", "memory"],
+        // "group:memory" expands to {memory_search, memory_get} — bare "memory"
+        // is a section label, not a tool id, and silently no-ops.
+        allow: ["read", "write", "edit", "exec", "apply_patch", "browser", "sessions_send", "group:memory"],
         elevated: { enabled: true },
         // gateway, cron, plugin-management — owner-only, so they implicitly require ownerAllowFrom
       },
-      systemPrompt: "base-admin: full operator-tier agent for the EA org. Do not assume any sender is an admin without explicit verification of their Slack user ID against the admins accessGroup."
+      // Use `systemPromptOverride`, not `systemPrompt` (zod rejects systemPrompt at this level).
+      systemPromptOverride: "admin: full operator-tier agent for the EA org. Do not assume any sender is an admin without explicit verification of their Slack user ID against the admins accessGroup.",
     },
     {
-      id: "base-ops",
-      workspace: "/home/ubuntu/.openclaw/workspace-ops",
+      id: "ops",
+      workspace: "~/.openclaw/workspace-ops",
       sandbox: { mode: "all", scope: "agent", workspaceAccess: "rw" },
       tools: {
-        allow: ["read", "write", "edit", "browser", "sessions_send", "memory"],
+        allow: ["read", "write", "edit", "browser", "sessions_send", "group:memory"],
         deny:  ["exec", "apply_patch", "gateway", "cron"],
       },
-      systemPrompt: "base-ops: workflow-automation tier. You can draft, file, and update — but not execute shell commands, apply patches to the host, or modify gateway config."
+      systemPromptOverride: "ops: workflow-automation tier. You can draft, file, and update — but not execute shell commands, apply patches to the host, or modify gateway config.",
     },
     {
-      id: "base-view",
-      workspace: "/home/ubuntu/.openclaw/workspace-view",
+      id: "view",
+      default: true,                              // safest fallback agent
+      workspace: "~/.openclaw/workspace-view",
       sandbox: { mode: "all", scope: "agent", workspaceAccess: "ro" },
       tools: {
-        allow: ["read", "browser", "memory"],
+        allow: ["read", "browser", "group:memory"],
         deny:  ["write", "edit", "exec", "apply_patch", "sessions_send", "gateway", "cron"],
       },
-      systemPrompt: "base-view: read-only research/lookup tier. Refuse any request that would mutate state and suggest opening a ticket via #base-ai-ops instead."
+      systemPromptOverride: "view: read-only research/lookup tier. Refuse any request that would mutate state and suggest opening a ticket via #base-ai-ops instead.",
     },
   ],
-  default: "base-view",  // safest fallback
 }
 ```
 
@@ -165,23 +170,23 @@ Order matters; first match wins, ties broken by config order. List most-specific
 ```json5
 bindings: [
   // ---- Per-admin DM routing (one entry per admin) ----
-  { agentId: "base-admin", match: { channel: "slack", peer: { kind: "direct", id: "U_ADMIN_1" } } },
-  { agentId: "base-admin", match: { channel: "slack", peer: { kind: "direct", id: "U_ADMIN_2" } } },
+  { agentId: "admin", match: { channel: "slack", peer: { kind: "direct", id: "U_ADMIN_1" } } },
+  { agentId: "admin", match: { channel: "slack", peer: { kind: "direct", id: "U_ADMIN_2" } } },
 
   // ---- Per-operator DM routing (one entry per operator) ----
-  { agentId: "base-ops",   match: { channel: "slack", peer: { kind: "direct", id: "U_OPS_1" } } },
-  { agentId: "base-ops",   match: { channel: "slack", peer: { kind: "direct", id: "U_OPS_2" } } },
+  { agentId: "ops",   match: { channel: "slack", peer: { kind: "direct", id: "U_OPS_1" } } },
+  { agentId: "ops",   match: { channel: "slack", peer: { kind: "direct", id: "U_OPS_2" } } },
 
   // ---- Channel-as-tier ----
-  { agentId: "base-admin", match: { channel: "slack", peer: { kind: "channel", id: "C_ADMIN_CHAN" } } },
-  { agentId: "base-ops",   match: { channel: "slack", peer: { kind: "channel", id: "C_OPS_CHAN" } } },
-  { agentId: "base-view",  match: { channel: "slack", peer: { kind: "channel", id: "C_ASK_CHAN" } } },
+  { agentId: "admin", match: { channel: "slack", peer: { kind: "channel", id: "C_ADMIN_CHAN" } } },
+  { agentId: "ops",   match: { channel: "slack", peer: { kind: "channel", id: "C_OPS_CHAN" } } },
+  { agentId: "view",  match: { channel: "slack", peer: { kind: "channel", id: "C_ASK_CHAN" } } },
 
   // ---- DM catch-all (any non-admin/non-ops DM) ----
-  { agentId: "base-view",  match: { channel: "slack", peer: { kind: "direct", id: "*" } } },
+  { agentId: "view",  match: { channel: "slack", peer: { kind: "direct", id: "*" } } },
 
   // ---- Slack workspace catch-all (only if message somehow escapes the above) ----
-  { agentId: "base-view",  match: { channel: "slack", teamId: "T_WORKSPACE_ID" } },
+  { agentId: "view",  match: { channel: "slack", teamId: "T_WORKSPACE_ID" } },
 ]
 ```
 
@@ -195,8 +200,10 @@ bindings: [
 channels: {
   slack: {
     mode: "socket",                    // app-token + bot-token; no public webhook needed
-    botToken: { secret: "SLACK_BOT_TOKEN" },
-    appToken: { secret: "SLACK_APP_TOKEN" },
+    // SecretRef env-source form. The plain `{ secret: "X" }` shape is NOT valid;
+    // zod requires `{ source, provider, id }`. A literal string also works.
+    botToken: { source: "env", provider: "default", id: "SLACK_BOT_TOKEN" },
+    appToken: { source: "env", provider: "default", id: "SLACK_APP_TOKEN" },
 
     // ---- DM access control ----
     dmPolicy: "allowlist",
@@ -289,7 +296,8 @@ commands: {
   ],
   useAccessGroups: true,
   ownerDisplay: "hash",                // hash owner IDs in transcripts (avoid leakage)
-  ownerDisplaySecret: { secret: "OWNER_DISPLAY_HMAC_KEY" },
+  // Plain string only — zod rejects SecretRef objects here.
+  ownerDisplaySecret: "REPLACE_WITH_OWNER_DISPLAY_HMAC_KEY",
   // Do NOT set commands.allowFrom — it would override channel allowlists/pairing entirely.
 }
 ```
@@ -363,11 +371,11 @@ To run commands on the EC2, either SSH in interactively (`ssh -i keys/open-claw.
 1. In Slack, get their member ID (profile → "…" → "Copy member ID").
 2. `bai admin add <UID> [name]`
    - Adds to `accessGroups.admins.members.slack[]`
-   - Adds per-user DM binding to `base-admin` (front of list, beats wildcard)
+   - Adds per-user DM binding to `admin` (front of list, beats wildcard)
    - Adds `slack:<UID>` to `commands.ownerAllowFrom`
 3. In Slack, invite to `#base-ai-admin`, `#base-ai-ops`, `#base-ai-ask`.
 4. `bai reload`
-5. Verify by DMing the bot from the new admin account: should reach `base-admin`.
+5. Verify by DMing the bot from the new admin account: should reach `admin`.
 
 ### Adding a new operator
 
@@ -437,32 +445,32 @@ Five phases, each ending with verifiable proof before moving on.
 
 **Phase 1 — Single-tier Viewer-only sanity** (½ day)
 - Add `accessGroups.viewers` with one user (yourself).
-- Add `agents.list[base-view]` with the read-only tool set.
-- Add the DM-wildcard binding to `base-view` and the workspace catch-all.
+- Add `agents.list[view]` with the read-only tool set.
+- Add the DM-wildcard binding to `view` and the workspace catch-all.
 - Set `dmPolicy: "allowlist"` with `allowFrom: ["accessGroup:viewers"]`.
 - Verify: DM the bot from your account, get a response. DM from any other account, get nothing (or a polite refusal).
 
 **Phase 2 — Tier channels** (1 day)
 - Create `#base-ai-ask` (Viewer), `#base-ai-ops` (Operator), `#base-ai-admin` (Admin).
 - Add `accessGroups.operators` and `accessGroups.admins` with real members.
-- Add `agents.list[base-ops]` and `agents.list[base-admin]`.
+- Add `agents.list[ops]` and `agents.list[admin]`.
 - Add the channel bindings and per-user DM bindings.
 - Verify (table-test):
   | Test | Expected |
   |---|---|
-  | Admin DMs bot | lands in base-admin |
-  | Operator DMs bot | lands in base-ops |
-  | Viewer DMs bot | lands in base-view |
+  | Admin DMs bot | lands in admin |
+  | Operator DMs bot | lands in ops |
+  | Viewer DMs bot | lands in view |
   | Random staff DMs bot | rejected (not in any accessGroup) |
-  | @-mention in #base-ai-admin from admin | base-admin responds |
+  | @-mention in #base-ai-admin from admin | admin responds |
   | @-mention in #base-ai-admin from non-admin | won't happen — non-admins can't be in the channel |
-  | @-mention in #base-ai-ops from admin | **base-ops** responds (channel binding wins) — admin gets ops-tier tools there, by design |
-  | @-mention in #base-ai-ask from operator | **base-view** responds — same rule |
+  | @-mention in #base-ai-ops from admin | **ops** responds (channel binding wins) — admin gets ops-tier tools there, by design |
+  | @-mention in #base-ai-ask from operator | **view** responds — same rule |
 
 **Phase 3 — Exec approvals** (½ day)
 - Configure `channels.slack.execApprovals` with admin approvers.
-- Trigger an exec from `base-admin` and approve via the DM card.
-- Trigger an exec from `base-admin` and *deny*; verify the agent reports denial cleanly.
+- Trigger an exec from `admin` and approve via the DM card.
+- Trigger an exec from `admin` and *deny*; verify the agent reports denial cleanly.
 
 **Phase 4 — Audit + alerting** *(deferred for v1)*
 - Skipped per current scope. Investigation in v1 relies on Docker stdout, Slack workspace audit, and git history of `openclaw.json` (see Audit section).

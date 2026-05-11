@@ -50,9 +50,9 @@ COMPOSE_DIR="${BAI_COMPOSE_DIR:-$HOME/ea-openclaw}"
 # Tier metadata (kept in sync with the design spec).
 TIERS=(admins operators viewers)
 declare -A TIER_AGENT=(
-  [admins]="base-admin"
-  [operators]="base-ops"
-  [viewers]="base-view"
+  [admins]="admin"
+  [operators]="ops"
+  [viewers]="view"
 )
 declare -A TIER_LABEL=(
   [admins]="Admin"
@@ -133,27 +133,27 @@ cmd_init() {
   "agents": {
     "list": [
       {
-        "id": "base-admin",
+        "id": "admin",
         "workspace": "~/.openclaw/workspace-admin",
         "sandbox": { "mode": "off" },
         "tools": {
           "allow": ["read","write","edit","exec","apply_patch","browser","sessions_send","group:memory"],
           "elevated": { "enabled": true }
         },
-        "systemPromptOverride": "base-admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup."
+        "systemPromptOverride": "admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup."
       },
       {
-        "id": "base-ops",
+        "id": "ops",
         "workspace": "~/.openclaw/workspace-ops",
         "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "rw" },
         "tools": {
           "allow": ["read","write","edit","browser","sessions_send","group:memory"],
           "deny":  ["exec","apply_patch","gateway","cron"]
         },
-        "systemPromptOverride": "base-ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config."
+        "systemPromptOverride": "ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config."
       },
       {
-        "id": "base-view",
+        "id": "view",
         "default": true,
         "workspace": "~/.openclaw/workspace-view",
         "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "ro" },
@@ -161,16 +161,16 @@ cmd_init() {
           "allow": ["read","browser","group:memory"],
           "deny":  ["write","edit","exec","apply_patch","sessions_send","gateway","cron"]
         },
-        "systemPromptOverride": "base-view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead."
+        "systemPromptOverride": "view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead."
       }
     ]
   },
   "bindings": [
-    { "agentId": "base-admin", "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_ADMIN_CHANNEL_ID" } } },
-    { "agentId": "base-ops",   "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_OPS_CHANNEL_ID" } } },
-    { "agentId": "base-view",  "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_ASK_CHANNEL_ID" } } },
-    { "agentId": "base-view",  "match": { "channel": "slack", "peer": { "kind": "direct",  "id": "*" } } },
-    { "agentId": "base-view",  "match": { "channel": "slack", "teamId": "REPLACE_WITH_WORKSPACE_ID" } }
+    { "agentId": "admin", "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_ADMIN_CHANNEL_ID" } } },
+    { "agentId": "ops",   "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_OPS_CHANNEL_ID" } } },
+    { "agentId": "view",  "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_ASK_CHANNEL_ID" } } },
+    { "agentId": "view",  "match": { "channel": "slack", "peer": { "kind": "direct",  "id": "*" } } },
+    { "agentId": "view",  "match": { "channel": "slack", "teamId": "REPLACE_WITH_WORKSPACE_ID" } }
   ],
   "channels": {
     "slack": {
@@ -238,7 +238,7 @@ JSON
     #
     # Caveat: jq's `*` does NOT deep-merge arrays — it picks the right-hand
     # side wholesale. We work around that below for agents.list, where the
-    # base-admin/ops/view agents would otherwise be lost if the user already
+    # admin/ops/view agents would otherwise be lost if the user already
     # has any agents at all.
     local backup="$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
     cp "$CONFIG_FILE" "$backup"
@@ -269,7 +269,7 @@ JSON
     echo "    execApprovals, etc."
     echo
     echo "What --merge handled for arrays (jq's '*' doesn't deep-merge them):"
-    echo "  • agents.list — any of 'base-admin', 'base-ops', 'base-view' that"
+    echo "  • agents.list — any of 'admin', 'ops', 'view' that"
     echo "    weren't in your existing list got appended (matched by id)."
     echo
     echo "What --merge could NOT do automatically:"
@@ -497,7 +497,7 @@ cmd_validate() {
     fi
   done
 
-  for agent in base-admin base-ops base-view; do
+  for agent in admin ops view; do
     if ! jq -e --arg a "$agent" '.agents.list[] | select(.id == $a)' "$CONFIG_FILE" >/dev/null; then
       echo "  ✗ agents.list missing entry for '$agent'"
       errors=$((errors + 1))
@@ -535,7 +535,7 @@ cmd_validate() {
   # Sanity: no user should be in more than one tier (set-semantics on add).
   local dupes
   dupes="$(jq -r '
-    [.accessGroups | to_entries[]
+    [((.accessGroups // {}) | to_entries[])
      | .key as $t
      | (.value.members.slack // [])[] as $u
      | {tier: $t, uid: $u}]
