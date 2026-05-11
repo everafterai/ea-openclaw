@@ -10,6 +10,8 @@
 #
 # Usage:
 #   bai init                       # bootstrap a skeleton openclaw.json
+#   bai init --merge               # add missing pieces to an existing openclaw.json
+#                                  # (keeps everything you have; writes .bak first)
 #   bai admin    add <UID> [name]  # promote user to Admin tier
 #   bai admin    remove <UID>      # demote user from Admin tier
 #   bai admin    list              # list current admins
@@ -97,15 +99,31 @@ prefixed_slack_id() { echo "slack:$1"; }
 # --- subcommand: init ---
 
 cmd_init() {
-  local force=0
-  if [[ "${1:-}" == "--force" ]]; then force=1; shift; fi
+  local mode="create"     # create | force | merge
+  case "${1:-}" in
+    --force) mode="force"; shift ;;
+    --merge) mode="merge"; shift ;;
+    "") : ;;
+    *) die "unknown 'init' flag: ${1} (try --force or --merge)" ;;
+  esac
 
-  if [[ -f "$CONFIG_FILE" && $force -eq 0 ]]; then
-    die "$CONFIG_FILE already exists — pass --force to overwrite"
+  if [[ -f "$CONFIG_FILE" && "$mode" == "create" ]]; then
+    die "$CONFIG_FILE already exists — pass --merge to add missing pieces only, or --force to overwrite"
+  fi
+  if [[ ! -f "$CONFIG_FILE" && "$mode" == "merge" ]]; then
+    die "$CONFIG_FILE does not exist — run 'bai init' (no flag) to bootstrap from scratch"
   fi
 
   mkdir -p "$(dirname "$CONFIG_FILE")"
-  cat > "$CONFIG_FILE" <<'JSON'
+
+  # Write the skeleton to a temp file first. In --merge mode we then merge
+  # the existing file ON TOP of the skeleton — anything the user already
+  # has wins; only missing keys get filled in from the skeleton.
+  local skeleton_tmp
+  skeleton_tmp="$(mktemp -t bai.skel.XXXXXX)"
+  trap 'rm -f "$skeleton_tmp"' RETURN
+
+  cat > "$skeleton_tmp" <<'JSON'
 {
   "accessGroups": {
     "admins":    { "type": "message.senders", "members": { "slack": [] } },
@@ -212,17 +230,77 @@ cmd_init() {
   }
 }
 JSON
-  jq -e . "$CONFIG_FILE" >/dev/null || die "init wrote invalid JSON (this is a bug — please report)"
-  echo "bai: wrote skeleton to $CONFIG_FILE"
-  echo
-  echo "Next steps:"
-  echo "  1. Edit the config to replace REPLACE_WITH_… placeholders"
-  echo "     with real Slack workspace and channel IDs."
-  echo "  2. bai admin add <UID>     # at least one admin"
-  echo "  3. bai operator add <UID>  # zero or more operators"
-  echo "  4. bai viewer add <UID>    # zero or more viewers"
-  echo "  5. bai validate            # sanity-check the config"
-  echo "  6. bai reload              # ask the gateway to pick up the changes"
+  jq -e . "$skeleton_tmp" >/dev/null || die "init produced invalid JSON skeleton (this is a bug — please report)"
+
+  local out_tmp
+  out_tmp="$(mktemp -t bai.out.XXXXXX)"
+  trap 'rm -f "$skeleton_tmp" "$out_tmp"' RETURN
+
+  if [[ "$mode" == "merge" ]]; then
+    # jq's `*` is a recursive merge. (skeleton * existing) means: start with
+    # the skeleton, then overlay the existing config on top — existing values
+    # win on conflicts, missing keys are filled in from the skeleton.
+    # Net effect: nothing the user has is lost; only gaps are filled.
+    #
+    # Caveat: jq's `*` does NOT deep-merge arrays — it picks the right-hand
+    # side wholesale. We work around that below for agents.list, where the
+    # base-admin/ops/view agents would otherwise be lost if the user already
+    # has any agents at all.
+    local backup="$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
+    cp "$CONFIG_FILE" "$backup"
+    if ! jq -s '
+      .[0] as $skel | .[1] as $existing
+      | ($skel * $existing) as $merged
+      # Append any base-* agents from the skeleton that the merged result
+      # doesn'\''t already have (matched by id).
+      | $merged
+      | .agents.list = (
+          (.agents.list // []) as $current
+          | ($skel.agents.list // []) as $skel_agents
+          | $current
+            + ($skel_agents | map(select(.id as $id | $current | map(.id) | index($id) | not)))
+        )
+    ' "$skeleton_tmp" "$CONFIG_FILE" > "$out_tmp"; then
+      die "merge failed; original config left at $CONFIG_FILE (backup at $backup)"
+    fi
+    jq -e . "$out_tmp" >/dev/null || die "merge produced invalid JSON; original config preserved"
+    mv "$out_tmp" "$CONFIG_FILE"
+    echo "bai: merged skeleton into $CONFIG_FILE"
+    echo "     backup: $backup"
+    echo
+    echo "What --merge did:"
+    echo "  • kept everything you already had (tokens, agents, channels, model"
+    echo "    providers, etc. — untouched)"
+    echo "  • filled in top-level keys you didn't have: accessGroups, commands,"
+    echo "    execApprovals, etc."
+    echo
+    echo "What --merge handled for arrays (jq's '*' doesn't deep-merge them):"
+    echo "  • agents.list — any of 'base-admin', 'base-ops', 'base-view' that"
+    echo "    weren't in your existing list got appended (matched by id)."
+    echo
+    echo "What --merge could NOT do automatically:"
+    echo "  • bindings — if you already had bindings, they were left as-is. You"
+    echo "    likely need to add per-channel + DM-wildcard bindings."
+    echo "  • channels.slack.channels — per-channel blocks may be missing."
+    echo
+    echo "Run 'bai validate' for an actionable punch list of what's still missing,"
+    echo "or diff against the skeleton:"
+    echo "  diff <(jq . $backup) <(jq . $CONFIG_FILE)"
+  else
+    mv "$skeleton_tmp" "$CONFIG_FILE"
+    echo "bai: wrote skeleton to $CONFIG_FILE"
+    echo
+    echo "Next steps:"
+    echo "  1. Edit the config to replace REPLACE_WITH_… placeholders"
+    echo "     with real Slack workspace and channel IDs."
+    echo "  2. bai admin add <UID>     # at least one admin"
+    echo "  3. bai operator add <UID>  # zero or more operators"
+    echo "  4. bai viewer add <UID>    # zero or more viewers"
+    echo "  5. bai validate            # sanity-check the config"
+    echo "  6. bai reload              # ask the gateway to pick up the changes"
+  fi
+
+  trap - RETURN
 }
 
 # --- subcommand: <tier> add / remove / list ---
@@ -427,7 +505,7 @@ cmd_validate() {
 
   for agent in base-admin base-ops base-view; do
     if ! jq -e --arg a "$agent" '.agents.list[] | select(.id == $a)' "$CONFIG_FILE" >/dev/null; then
-      echo "  ✗ agents.list missing entry for '$a'"
+      echo "  ✗ agents.list missing entry for '$agent'"
       errors=$((errors + 1))
     fi
   done
@@ -524,7 +602,7 @@ cmd_path() { echo "$CONFIG_FILE"; }
 # --- subcommand: help ---
 
 cmd_help() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- dispatch ---
