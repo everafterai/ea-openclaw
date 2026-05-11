@@ -634,17 +634,89 @@ cmd_migrate() {
           type != "string" or (startswith("accessGroup:") | not)
         )))
         | if (.value.users | length) == 0 then .value |= del(.users) else . end))
+    # 10. accessGroups.<name>.type: force to "message.senders" (the only sensible
+    #     value for Slack/Telegram/cross-channel use; the zod discriminator only
+    #     accepts "message.senders" | "discord.channelAudience").
+    | .accessGroups = ((.accessGroups // {}) | with_entries(
+        .value.type = "message.senders"))
+    # 11. Ensure the three tier agents exist. Append any of admin/ops/view that
+    #     are missing — with the same shapes as the init skeleton. Existing
+    #     entries (whatever the user has tweaked) are kept untouched.
+    # NOTE: workspace + agentDir directory creation happens AFTER the jq pass,
+    #       in the bash wrapper. See the post-write hook in cmd_migrate.
+    | (.agents.list // []) as $current
+    | (
+        [
+          {
+            id: "admin",
+            workspace: "~/.openclaw/workspace-admin",
+            sandbox: { mode: "off" },
+            tools: {
+              allow: ["read","write","edit","exec","apply_patch","browser","sessions_send","group:memory"],
+              elevated: { enabled: true }
+            },
+            systemPromptOverride: "admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup."
+          },
+          {
+            id: "ops",
+            workspace: "~/.openclaw/workspace-ops",
+            sandbox: { mode: "all", scope: "agent", workspaceAccess: "rw" },
+            tools: {
+              allow: ["read","write","edit","browser","sessions_send","group:memory"],
+              deny: ["exec","apply_patch","gateway","cron"]
+            },
+            systemPromptOverride: "ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config."
+          },
+          {
+            id: "view",
+            default: true,
+            workspace: "~/.openclaw/workspace-view",
+            sandbox: { mode: "all", scope: "agent", workspaceAccess: "ro" },
+            tools: {
+              allow: ["read","browser","group:memory"],
+              deny: ["write","edit","exec","apply_patch","sessions_send","gateway","cron"]
+            },
+            systemPromptOverride: "view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead."
+          }
+        ] | map(select(.id as $id | ($current | map(.id) | index($id)) == null))
+      ) as $missing
+    | .agents.list = ($current + $missing)
   '
+
+  # Create workspace + agentDir on disk for any agent that has a tilde-form
+  # workspace path. Some UI surfaces appear to require the dirs to exist
+  # before listing the agent (the agent runtime mkdirs them on first
+  # invocation, but the listing path doesn't trigger that). Cheap to create
+  # eagerly here.
+  local agents_root="$HOME/.openclaw/agents"
+  local workspace_root="$HOME/.openclaw"
+  while read -r agent_id; do
+    [[ -z "$agent_id" ]] && continue
+    mkdir -p "$agents_root/$agent_id/agent"
+  done < <(jq -r '.agents.list[]?.id // empty' "$CONFIG_FILE")
+
+  while read -r ws_path; do
+    [[ -z "$ws_path" ]] && continue
+    # Only expand ~ and ~/ forms; leave absolute paths alone (they may point
+    # somewhere the script user can't write).
+    case "$ws_path" in
+      "~"|"~/"*) mkdir -p "${ws_path/#~/$HOME}" ;;
+      *) : ;;
+    esac
+  done < <(jq -r '.agents.list[]?.workspace // empty' "$CONFIG_FILE")
 
   echo "bai: migrated $CONFIG_FILE"
   echo "     backup: $backup"
+  echo "     agentDirs + workspaces ensured on disk"
   echo
   echo "Next:"
   echo "  1. Run 'openclaw doctor --fix' for the gateway-side legacy renames"
   echo "     (chunkMode → streaming.chunkMode, channels.<id>.allow → enabled, etc.)"
-  echo "  2. Set a real value for commands.ownerDisplaySecret:"
-  echo "     SECRET=\$(openssl rand -hex 32); \\"
-  echo "     jq --arg s \"\$SECRET\" '.commands.ownerDisplaySecret = \$s' \\"
+  echo "  2. Set a real value for commands.ownerDisplaySecret (or use raw mode):"
+  echo "     For hash mode: SECRET=\$(openssl rand -hex 32); \\"
+  echo "       jq --arg s \"\$SECRET\" '.commands.ownerDisplaySecret = \$s' \\"
+  echo "         $CONFIG_FILE > /tmp/o.json && mv /tmp/o.json $CONFIG_FILE"
+  echo "     For raw mode: jq '.commands.ownerDisplay = \"raw\" | del(.commands.ownerDisplaySecret)' \\"
   echo "       $CONFIG_FILE > /tmp/o.json && mv /tmp/o.json $CONFIG_FILE"
   echo "  3. bai validate"
   echo "  4. openclaw gateway restart (or: bai reload)"
