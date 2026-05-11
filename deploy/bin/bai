@@ -25,6 +25,12 @@
 #   bai whois <UID>                # show which tier(s) a user is in
 #   bai tiers                      # summary table of all 3 tiers
 #   bai validate                   # check JSON syntax + structural sanity
+#   bai migrate                    # one-shot fixup for configs written against
+#                                  # the older skeleton (renames base-* → *,
+#                                  # fixes botToken/appToken/ownerDisplaySecret
+#                                  # shapes, drops invalid execApprovals.enabled,
+#                                  # rewrites tools "memory" → "group:memory",
+#                                  # strips accessGroup: from per-channel users)
 #   bai reload                     # validate, then reload the gateway
 #   bai path                       # print path to the config file
 #   bai help                       # this help
@@ -558,6 +564,92 @@ cmd_validate() {
   fi
 }
 
+# --- subcommand: migrate ---
+#
+# One-shot fixup for configs that were written against the older skeleton or
+# the older OpenClaw schema. Idempotent — safe to run multiple times. Always
+# writes a timestamped backup before mutating.
+#
+# What it does:
+#   1. Renames agent IDs base-admin/base-ops/base-view → admin/ops/view
+#      (and rewrites bindings[].agentId to match).
+#   2. Rewrites workspace paths from /home/ubuntu/.openclaw/... → ~/.openclaw/...
+#      so the path resolves correctly inside the container.
+#   3. agents.list[].systemPrompt → systemPromptOverride.
+#   4. agents.default (string, invalid) → "default": true on the matching entry.
+#   5. commands.ownerDisplaySecret: object → string placeholder.
+#   6. channels.slack.botToken / appToken: {secret: X} → SecretRef env form.
+#   7. channels.slack.execApprovals.enabled "auto" → omitted (zod only accepts boolean).
+#   8. tools.allow/deny: replace bare "memory" (section label, not a tool) with "group:memory".
+#   9. channels.slack.channels.<id>.users: strip "accessGroup:*" entries
+#      (the slack channel gate doesn't expand them; they'd silently reject all users).
+#
+# Does NOT do: openclaw's own legacy renames (chunkMode → streaming.chunkMode,
+# channels.<id>.allow → enabled, etc.). Run `openclaw doctor --fix` separately
+# for those.
+cmd_migrate() {
+  require_config
+  local backup="$CONFIG_FILE.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$CONFIG_FILE" "$backup"
+
+  write_json '
+      .agents.list = ((.agents.list // []) | map(.id |= sub("^base-"; "")))
+    | .bindings    = ((.bindings   // []) | map(.agentId |= sub("^base-"; "")))
+    | .agents.list = (.agents.list | map(
+        if (.workspace // null | type) == "string"
+        then .workspace |= sub("^/home/ubuntu/.openclaw/"; "~/.openclaw/")
+        else . end))
+    | .agents.list = (.agents.list | map(
+        if has("systemPrompt")
+        then .systemPromptOverride = .systemPrompt | del(.systemPrompt)
+        else . end))
+    | (.agents.default // null) as $def
+    | if $def != null then ($def | sub("^base-"; "")) as $d
+        | .agents.list = (.agents.list | map(if .id == $d then .default = true else . end))
+        | del(.agents.default)
+      else . end
+    | if (.commands.ownerDisplaySecret // null | type) == "object"
+      then .commands.ownerDisplaySecret = "REPLACE_WITH_OWNER_DISPLAY_HMAC_KEY"
+      else . end
+    | if (.channels.slack.botToken // null | type) == "object"
+         and (.channels.slack.botToken | has("secret"))
+      then .channels.slack.botToken = {
+        source: "env", provider: "default", id: .channels.slack.botToken.secret
+      }
+      else . end
+    | if (.channels.slack.appToken // null | type) == "object"
+         and (.channels.slack.appToken | has("secret"))
+      then .channels.slack.appToken = {
+        source: "env", provider: "default", id: .channels.slack.appToken.secret
+      }
+      else . end
+    | if (.channels.slack.execApprovals.enabled // null) == "auto"
+      then .channels.slack.execApprovals |= del(.enabled)
+      else . end
+    | .agents.list = (.agents.list | map(
+        (if .tools.allow then .tools.allow |= map(if . == "memory" then "group:memory" else . end) else . end)
+        | (if .tools.deny then .tools.deny |= map(if . == "memory" then "group:memory" else . end) else . end)))
+    | .channels.slack.channels = ((.channels.slack.channels // {}) | with_entries(
+        .value.users = ((.value.users // []) | map(select(
+          type != "string" or (startswith("accessGroup:") | not)
+        )))
+        | if (.value.users | length) == 0 then .value |= del(.users) else . end))
+  '
+
+  echo "bai: migrated $CONFIG_FILE"
+  echo "     backup: $backup"
+  echo
+  echo "Next:"
+  echo "  1. Run 'openclaw doctor --fix' for the gateway-side legacy renames"
+  echo "     (chunkMode → streaming.chunkMode, channels.<id>.allow → enabled, etc.)"
+  echo "  2. Set a real value for commands.ownerDisplaySecret:"
+  echo "     SECRET=\$(openssl rand -hex 32); \\"
+  echo "     jq --arg s \"\$SECRET\" '.commands.ownerDisplaySecret = \$s' \\"
+  echo "       $CONFIG_FILE > /tmp/o.json && mv /tmp/o.json $CONFIG_FILE"
+  echo "  3. bai validate"
+  echo "  4. openclaw gateway restart (or: bai reload)"
+}
+
 # --- subcommand: reload ---
 #
 # Validates the local config, then asks the gateway to reload. Tries the
@@ -596,7 +688,7 @@ cmd_path() { echo "$CONFIG_FILE"; }
 # --- subcommand: help ---
 
 cmd_help() {
-  sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- dispatch ---
@@ -638,6 +730,7 @@ case "$cmd" in
   whois)              cmd_whois "$@" ;;
   tiers)              cmd_tiers ;;
   validate|check)     cmd_validate ;;
+  migrate)            cmd_migrate ;;
   reload)             cmd_reload ;;
   path)               cmd_path ;;
   -h|--help|help)     cmd_help ;;
