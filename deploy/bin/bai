@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# bai — base-ai RBAC config CLI for the OpenClaw gateway.
+#
+# Runs on the EC2 host. Manages accessGroups, per-user DM bindings, and
+# commands.ownerAllowFrom inside ~/.openclaw/openclaw.json (the file the
+# OpenClaw container reads via bind-mount).
+#
+# See docs/superpowers/specs/2026-05-10-openclaw-slack-rbac-design.md
+# for the design this CLI operationalizes.
+#
+# Usage:
+#   bai init                       # bootstrap a skeleton openclaw.json
+#   bai admin    add <UID> [name]  # promote user to Admin tier
+#   bai admin    remove <UID>      # demote user from Admin tier
+#   bai admin    list              # list current admins
+#   bai operator add <UID> [name]  # promote user to Operator tier
+#   bai operator remove <UID>      # demote user from Operator tier
+#   bai operator list              # list current operators
+#   bai viewer   add <UID> [name]  # promote user to Viewer tier
+#   bai viewer   remove <UID>      # demote user from Viewer tier
+#   bai viewer   list              # list current viewers
+#
+#   bai whois <UID>                # show which tier(s) a user is in
+#   bai tiers                      # summary table of all 3 tiers
+#   bai validate                   # check JSON syntax + structural sanity
+#   bai reload                     # validate, then reload the gateway
+#   bai path                       # print path to the config file
+#   bai help                       # this help
+#
+# User IDs are Slack member IDs (U… or W…). Get them in Slack:
+#   click profile → "…" menu → "Copy member ID".
+# The optional [name] arg is for confirmation echo only — not stored anywhere.
+#
+# Environment variables:
+#   BAI_CONFIG          Override config file path
+#                       (default: $HOME/.openclaw/openclaw.json)
+#   BAI_COMPOSE_DIR     ea-openclaw clone dir used for reload fallback
+#                       (default: $HOME/ea-openclaw)
+#
+# Requires: bash 4+, jq.
+
+set -euo pipefail
+
+# --- locate config ---
+CONFIG_FILE="${BAI_CONFIG:-$HOME/.openclaw/openclaw.json}"
+COMPOSE_DIR="${BAI_COMPOSE_DIR:-$HOME/ea-openclaw}"
+
+# Tier metadata (kept in sync with the design spec).
+TIERS=(admins operators viewers)
+declare -A TIER_AGENT=(
+  [admins]="base-admin"
+  [operators]="base-ops"
+  [viewers]="base-view"
+)
+declare -A TIER_LABEL=(
+  [admins]="Admin"
+  [operators]="Operator"
+  [viewers]="Viewer"
+)
+
+# --- helpers ---
+
+die() { echo "bai: $*" >&2; exit 1; }
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required but not installed (brew install jq)"
+}
+
+require_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "config not found at $CONFIG_FILE — run 'bai init' first"
+  jq -e . "$CONFIG_FILE" >/dev/null 2>&1 || die "config at $CONFIG_FILE is not valid JSON"
+}
+
+validate_user_id() {
+  local uid="$1"
+  [[ "$uid" =~ ^[UW][A-Z0-9]+$ ]] || die "invalid Slack user ID '$uid' (expected /^[UW][A-Z0-9]+\$/)"
+}
+
+# Atomic JSON write: jq → tempfile → mv. Validates structure on the way.
+write_json() {
+  local jq_program="$1"
+  shift
+  local tmp
+  tmp="$(mktemp -t bai.XXXXXX)"
+  trap 'rm -f "$tmp"' RETURN
+  if ! jq "$@" "$jq_program" "$CONFIG_FILE" > "$tmp"; then
+    die "jq transformation failed; config not modified"
+  fi
+  jq -e . "$tmp" >/dev/null || die "jq output is not valid JSON; config not modified"
+  mv "$tmp" "$CONFIG_FILE"
+  trap - RETURN
+}
+
+# Resolve the canonical "slack:UID" prefix used in commands.ownerAllowFrom.
+prefixed_slack_id() { echo "slack:$1"; }
+
+# --- subcommand: init ---
+
+cmd_init() {
+  local force=0
+  if [[ "${1:-}" == "--force" ]]; then force=1; shift; fi
+
+  if [[ -f "$CONFIG_FILE" && $force -eq 0 ]]; then
+    die "$CONFIG_FILE already exists — pass --force to overwrite"
+  fi
+
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat > "$CONFIG_FILE" <<'JSON'
+{
+  "accessGroups": {
+    "admins":    { "type": "message.senders", "members": { "slack": [] } },
+    "operators": { "type": "message.senders", "members": { "slack": [] } },
+    "viewers":   { "type": "message.senders", "members": { "slack": [] } }
+  },
+  "agents": {
+    "default": "base-view",
+    "list": [
+      {
+        "id": "base-admin",
+        "workspace": "/home/ubuntu/.openclaw/workspace-admin",
+        "sandbox": { "mode": "off" },
+        "tools": {
+          "allow": ["read","write","edit","exec","apply_patch","browser","sessions_send","memory"],
+          "elevated": { "enabled": true }
+        },
+        "systemPrompt": "base-admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup."
+      },
+      {
+        "id": "base-ops",
+        "workspace": "/home/ubuntu/.openclaw/workspace-ops",
+        "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "rw" },
+        "tools": {
+          "allow": ["read","write","edit","browser","sessions_send","memory"],
+          "deny":  ["exec","apply_patch","gateway","cron"]
+        },
+        "systemPrompt": "base-ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config."
+      },
+      {
+        "id": "base-view",
+        "workspace": "/home/ubuntu/.openclaw/workspace-view",
+        "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "ro" },
+        "tools": {
+          "allow": ["read","browser","memory"],
+          "deny":  ["write","edit","exec","apply_patch","sessions_send","gateway","cron"]
+        },
+        "systemPrompt": "base-view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead."
+      }
+    ]
+  },
+  "bindings": [
+    { "agentId": "base-admin", "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_ADMIN_CHANNEL_ID" } } },
+    { "agentId": "base-ops",   "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_OPS_CHANNEL_ID" } } },
+    { "agentId": "base-view",  "match": { "channel": "slack", "peer": { "kind": "channel", "id": "REPLACE_WITH_ASK_CHANNEL_ID" } } },
+    { "agentId": "base-view",  "match": { "channel": "slack", "peer": { "kind": "direct",  "id": "*" } } },
+    { "agentId": "base-view",  "match": { "channel": "slack", "teamId": "REPLACE_WITH_WORKSPACE_ID" } }
+  ],
+  "channels": {
+    "slack": {
+      "mode": "socket",
+      "botToken":  { "secret": "SLACK_BOT_TOKEN" },
+      "appToken":  { "secret": "SLACK_APP_TOKEN" },
+      "dmPolicy":  "allowlist",
+      "allowFrom": ["accessGroup:admins", "accessGroup:operators", "accessGroup:viewers"],
+      "dm":          { "enabled": true, "groupEnabled": false },
+      "groupPolicy": "allowlist",
+      "dangerouslyAllowNameMatching": false,
+      "replyToMode": "first",
+      "thread": {
+        "requireExplicitMention": true,
+        "historyScope": "thread",
+        "inheritParent": false,
+        "initialHistoryLimit": 20
+      },
+      "requireMention": true,
+      "allowBots": false,
+      "channels": {
+        "REPLACE_WITH_ADMIN_CHANNEL_ID": {
+          "allow": true,
+          "users": ["accessGroup:admins"],
+          "requireMention": true,
+          "systemPrompt": "You are in #base-ai-admin. Treat senders as admin tier. Audit every exec."
+        },
+        "REPLACE_WITH_OPS_CHANNEL_ID": {
+          "allow": true,
+          "users": ["accessGroup:admins", "accessGroup:operators"],
+          "requireMention": true,
+          "systemPrompt": "You are in #base-ai-ops. No exec, no apply_patch — refuse and suggest DMing an admin."
+        },
+        "REPLACE_WITH_ASK_CHANNEL_ID": {
+          "allow": true,
+          "users": ["accessGroup:admins", "accessGroup:operators", "accessGroup:viewers"],
+          "requireMention": true,
+          "systemPrompt": "You are in #base-ai-ask. Read-only Q&A only. Refuse write requests and link to #base-ai-ops."
+        }
+      },
+      "execApprovals": {
+        "enabled": "auto",
+        "approvers": ["accessGroup:admins"],
+        "target": "dm"
+      },
+      "streaming": { "mode": "partial" },
+      "chunkMode": "newline",
+      "ackReaction": "eyes",
+      "typingReaction": "hourglass_flowing_sand"
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": [],
+    "useAccessGroups": true,
+    "ownerDisplay": "hash",
+    "ownerDisplaySecret": { "secret": "OWNER_DISPLAY_HMAC_KEY" }
+  }
+}
+JSON
+  jq -e . "$CONFIG_FILE" >/dev/null || die "init wrote invalid JSON (this is a bug — please report)"
+  echo "bai: wrote skeleton to $CONFIG_FILE"
+  echo
+  echo "Next steps:"
+  echo "  1. Edit the config to replace REPLACE_WITH_… placeholders"
+  echo "     with real Slack workspace and channel IDs."
+  echo "  2. bai admin add <UID>     # at least one admin"
+  echo "  3. bai operator add <UID>  # zero or more operators"
+  echo "  4. bai viewer add <UID>    # zero or more viewers"
+  echo "  5. bai validate            # sanity-check the config"
+  echo "  6. bai reload              # ask the gateway to pick up the changes"
+}
+
+# --- subcommand: <tier> add / remove / list ---
+
+# tier_add <tier> <uid> [name]
+#
+# Set-semantics: the user ends up in exactly one tier (the target). If they
+# were in another tier already, they are removed from it. Idempotent re-runs
+# are noops. ownerAllowFrom is added iff the target tier is admins, and is
+# removed otherwise (handles the demote-via-add case).
+tier_add() {
+  local tier="$1" uid="$2" name="${3:-}"
+  validate_user_id "$uid"
+  require_config
+  local agent="${TIER_AGENT[$tier]}"
+  local prefixed
+  prefixed="$(prefixed_slack_id "$uid")"
+
+  # Detect existing tier(s) before mutating, for the report.
+  local previous=""
+  for t in "${TIERS[@]}"; do
+    if [[ "$t" != "$tier" ]] && jq -e --arg t "$t" --arg u "$uid" \
+         '(.accessGroups[$t].members.slack // []) | index($u)' "$CONFIG_FILE" >/dev/null
+    then
+      previous="${previous:+$previous, }${TIER_LABEL[$t]}"
+    fi
+  done
+
+  write_json '
+    # 1. Remove from every other tier (admins/operators/viewers ∖ {target}).
+      reduce (["admins","operators","viewers"] - [$tier])[] as $t (
+        .;
+        .accessGroups[$t].members.slack |= ((. // []) | map(select(. != $uid)))
+      )
+    # 2. Add to target tier.
+    | .accessGroups[$tier].members.slack |= ((. // []) + [$uid] | unique)
+    # 3. ownerAllowFrom: add iff target is admins, remove otherwise (covers
+    #    the case where we are demoting an existing admin via a re-add to
+    #    a lower tier).
+    | (if $tier == "admins"
+        then .commands.ownerAllowFrom |= ((. // []) + [$prefixed] | unique)
+        else .commands.ownerAllowFrom |= ((. // []) | map(select(. != $prefixed)))
+       end)
+    # 4. Strip every per-user DM binding for this UID (any agent), then
+    #    insert the canonical one for the target tier at the front of the
+    #    bindings list (first-match-wins precedence).
+    | .bindings |= ((. // []) | map(select(
+        (.match.peer.kind // "") != "direct"
+        or (.match.peer.id // "") != $uid
+      )))
+    | .bindings |= [{
+        agentId: $agent,
+        match: { channel: "slack", peer: { kind: "direct", id: $uid } }
+      }] + .
+  ' \
+    --arg tier     "$tier" \
+    --arg uid      "$uid" \
+    --arg agent    "$agent" \
+    --arg prefixed "$prefixed"
+
+  local label="${TIER_LABEL[$tier]}"
+  local who="${name:+$name }($uid)"
+  who="${who:-$uid}"
+  if [[ -n "$previous" ]]; then
+    echo "bai: set $who tier to $label (was: $previous)"
+  else
+    echo "bai: set $who tier to $label"
+  fi
+  echo "  → accessGroup:$tier"
+  echo "  → bindings: DM peer:direct:$uid → $agent"
+  if [[ "$tier" == "admins" ]]; then
+    echo "  → commands.ownerAllowFrom: $prefixed"
+    echo "  Reminder: invite $uid to #base-ai-admin, #base-ai-ops, #base-ai-ask"
+  elif [[ "$tier" == "operators" ]]; then
+    echo "  Reminder: invite $uid to #base-ai-ops, #base-ai-ask"
+    if [[ "$previous" == *"Admin"* ]]; then
+      echo "  Reminder: also kick $uid from #base-ai-admin (demotion)"
+    fi
+  else
+    echo "  Reminder: invite $uid to #base-ai-ask"
+    if [[ "$previous" == *"Admin"* ]]; then
+      echo "  Reminder: also kick $uid from #base-ai-admin and #base-ai-ops (demotion)"
+    elif [[ "$previous" == *"Operator"* ]]; then
+      echo "  Reminder: also kick $uid from #base-ai-ops (demotion)"
+    fi
+  fi
+}
+
+tier_remove() {
+  local tier="$1" uid="$2"
+  validate_user_id "$uid"
+  require_config
+  local agent="${TIER_AGENT[$tier]}"
+  local prefixed
+  prefixed="$(prefixed_slack_id "$uid")"
+
+  write_json '
+    .accessGroups[$tier].members.slack |= ((. // []) | map(select(. != $uid)))
+    | (if $tier == "admins"
+        then .commands.ownerAllowFrom |= ((. // []) | map(select(. != $prefixed)))
+        else .
+       end)
+    | .bindings |= ((. // []) | map(select(
+        .agentId != $agent
+        or (.match.peer.kind // "") != "direct"
+        or (.match.peer.id // "")   != $uid
+      )))
+  ' \
+    --arg tier     "$tier" \
+    --arg uid      "$uid" \
+    --arg agent    "$agent" \
+    --arg prefixed "$prefixed"
+
+  local label="${TIER_LABEL[$tier]}"
+  echo "bai: removed $uid from $label tier"
+  echo "  Reminder: also kick $uid from the corresponding Slack channels"
+}
+
+tier_list() {
+  local tier="$1"
+  require_config
+  local count
+  count="$(jq -r --arg t "$tier" '.accessGroups[$t].members.slack // [] | length' "$CONFIG_FILE")"
+  echo "${TIER_LABEL[$tier]} tier ($count member$([[ $count -eq 1 ]] || echo s)):"
+  if [[ "$count" -eq 0 ]]; then
+    echo "  (none)"
+    return
+  fi
+  jq -r --arg t "$tier" '.accessGroups[$t].members.slack[] | "  \(.)"' "$CONFIG_FILE"
+}
+
+# --- subcommand: whois <uid> ---
+
+cmd_whois() {
+  local uid="${1:?usage: bai whois <UID>}"
+  validate_user_id "$uid"
+  require_config
+
+  local prefixed
+  prefixed="$(prefixed_slack_id "$uid")"
+
+  local found=0
+  for tier in "${TIERS[@]}"; do
+    if jq -e --arg t "$tier" --arg u "$uid" \
+        '(.accessGroups[$t].members.slack // []) | index($u)' "$CONFIG_FILE" >/dev/null
+    then
+      echo "  ${TIER_LABEL[$tier]} (accessGroup:$tier)"
+      found=1
+    fi
+  done
+
+  if jq -e --arg p "$prefixed" '(.commands.ownerAllowFrom // []) | index($p)' "$CONFIG_FILE" >/dev/null; then
+    echo "  Owner (commands.ownerAllowFrom)"
+    found=1
+  fi
+
+  local bindings
+  bindings="$(jq -r --arg u "$uid" '
+    [.bindings[]?
+     | select((.match.peer.kind // "") == "direct" and (.match.peer.id // "") == $u)
+     | "  DM binding → " + .agentId
+    ] | .[]
+  ' "$CONFIG_FILE")"
+  if [[ -n "$bindings" ]]; then
+    echo "$bindings"
+    found=1
+  fi
+
+  if [[ $found -eq 0 ]]; then
+    echo "$uid is not in any tier."
+  fi
+}
+
+# --- subcommand: tiers ---
+
+cmd_tiers() {
+  require_config
+  printf "%-10s %-12s %s\n" "TIER" "AGENT" "MEMBERS"
+  printf "%-10s %-12s %s\n" "----" "-----" "-------"
+  for tier in "${TIERS[@]}"; do
+    local count
+    count="$(jq -r --arg t "$tier" '.accessGroups[$t].members.slack // [] | length' "$CONFIG_FILE")"
+    printf "%-10s %-12s %s\n" "${TIER_LABEL[$tier]}" "${TIER_AGENT[$tier]}" "$count"
+  done
+}
+
+# --- subcommand: validate ---
+
+cmd_validate() {
+  require_config
+  local errors=0
+
+  echo "bai: validating $CONFIG_FILE"
+
+  # Structural sanity checks (any failure increments $errors but continues).
+  for tier in "${TIERS[@]}"; do
+    if ! jq -e --arg t "$tier" '.accessGroups[$t].members.slack' "$CONFIG_FILE" >/dev/null; then
+      echo "  ✗ accessGroups.$tier.members.slack missing"
+      errors=$((errors + 1))
+    fi
+  done
+
+  for agent in base-admin base-ops base-view; do
+    if ! jq -e --arg a "$agent" '.agents.list[] | select(.id == $a)' "$CONFIG_FILE" >/dev/null; then
+      echo "  ✗ agents.list missing entry for '$a'"
+      errors=$((errors + 1))
+    fi
+  done
+
+  if jq -e '[.. | strings | select(test("REPLACE_WITH"))] | length > 0' "$CONFIG_FILE" >/dev/null; then
+    local placeholders
+    placeholders="$(jq -r '[.. | strings | select(test("REPLACE_WITH"))] | unique | .[]' "$CONFIG_FILE")"
+    echo "  ⚠ unfilled placeholder(s):"
+    echo "$placeholders" | sed 's/^/      /'
+    errors=$((errors + 1))
+  fi
+
+  # Sanity: per-user DM bindings should reference the tier's agent for that user.
+  for tier in "${TIERS[@]}"; do
+    local agent="${TIER_AGENT[$tier]}"
+    local mismatched
+    mismatched="$(jq -r --arg t "$tier" --arg a "$agent" '
+      (.accessGroups[$t].members.slack // []) as $members
+      | [.bindings[]?
+         | select((.match.peer.kind // "") == "direct"
+                  and (.match.peer.id // "") as $id
+                      | ($members | index($id)) != null
+                  and .agentId != $a)
+         | .match.peer.id
+        ] | .[]
+    ' "$CONFIG_FILE")"
+    if [[ -n "$mismatched" ]]; then
+      echo "  ✗ $tier members with wrong-tier DM binding: $mismatched"
+      errors=$((errors + 1))
+    fi
+  done
+
+  # Sanity: no user should be in more than one tier (set-semantics on add).
+  local dupes
+  dupes="$(jq -r '
+    [.accessGroups | to_entries[]
+     | .key as $t
+     | (.value.members.slack // [])[] as $u
+     | {tier: $t, uid: $u}]
+    | group_by(.uid)
+    | map(select(length > 1))
+    | .[]
+    | "\(.[0].uid) in \(map(.tier) | join(", "))"
+  ' "$CONFIG_FILE")"
+  if [[ -n "$dupes" ]]; then
+    echo "  ✗ user(s) in multiple tiers (run 'bai <tier> add' to set canonically):"
+    echo "$dupes" | sed 's/^/      /'
+    errors=$((errors + 1))
+  fi
+
+  if [[ $errors -eq 0 ]]; then
+    echo "  ✓ all checks passed"
+  else
+    echo "  $errors issue(s) found"
+    return 1
+  fi
+}
+
+# --- subcommand: reload ---
+#
+# Validates the local config, then asks the gateway to reload. Tries the
+# `openclaw config reload` shim first (zero-downtime when supported);
+# falls back to `docker compose restart openclaw-gateway` (brief downtime).
+cmd_reload() {
+  require_config
+
+  echo "bai: validating before reload..."
+  cmd_validate || die "validation failed — fix issues before reloading"
+
+  if command -v openclaw >/dev/null 2>&1; then
+    echo "bai: openclaw config reload"
+    if openclaw config reload; then
+      echo "bai: reload done"
+      return 0
+    fi
+    echo "bai: 'openclaw config reload' failed — falling back to container restart" >&2
+  fi
+
+  if [[ -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
+    echo "bai: docker compose restart openclaw-gateway (in $COMPOSE_DIR)"
+    (cd "$COMPOSE_DIR" && \
+       docker compose -f docker-compose.yml -f docker-compose.prod.yml restart openclaw-gateway)
+    echo "bai: reload done"
+    return 0
+  fi
+
+  die "no 'openclaw' shim and no docker-compose dir at $COMPOSE_DIR — reload manually"
+}
+
+# --- subcommand: path ---
+
+cmd_path() { echo "$CONFIG_FILE"; }
+
+# --- subcommand: help ---
+
+cmd_help() {
+  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- dispatch ---
+
+require_jq
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  init)               cmd_init "$@" ;;
+  admin)
+    sub="${1:?usage: bai admin add|remove|list ...}"; shift
+    case "$sub" in
+      add)            tier_add admins "$@" ;;
+      remove|rm|del)  tier_remove admins "$@" ;;
+      list|ls)        tier_list admins ;;
+      *)              die "unknown 'admin' subcommand: $sub" ;;
+    esac
+    ;;
+  operator|op)
+    sub="${1:?usage: bai operator add|remove|list ...}"; shift
+    case "$sub" in
+      add)            tier_add operators "$@" ;;
+      remove|rm|del)  tier_remove operators "$@" ;;
+      list|ls)        tier_list operators ;;
+      *)              die "unknown 'operator' subcommand: $sub" ;;
+    esac
+    ;;
+  viewer|view)
+    sub="${1:?usage: bai viewer add|remove|list ...}"; shift
+    case "$sub" in
+      add)            tier_add viewers "$@" ;;
+      remove|rm|del)  tier_remove viewers "$@" ;;
+      list|ls)        tier_list viewers ;;
+      *)              die "unknown 'viewer' subcommand: $sub" ;;
+    esac
+    ;;
+  whois)              cmd_whois "$@" ;;
+  tiers)              cmd_tiers ;;
+  validate|check)     cmd_validate ;;
+  reload)             cmd_reload ;;
+  path)               cmd_path ;;
+  -h|--help|help)     cmd_help ;;
+  *)                  die "unknown command '$cmd' (try: bai help)" ;;
+esac

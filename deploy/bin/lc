@@ -5,9 +5,12 @@
 #   lc                     # status (alias for `lc ps`)
 #   lc ps                  # container status
 #   lc logs [args...]      # follow logs (passes args to `docker logs`)
-#   lc restart             # restart the litellm container
+#   lc restart             # restart container (config file changes only)
+#   lc reload              # alias for `lc restart`
+#   lc recreate            # `dcp up -d --force-recreate litellm` — pick up
+#                          # changes to .env / docker-compose.prod.yml that
+#                          # restart can't see (env vars are baked at create)
 #   lc edit                # edit deploy/litellm/config.yaml then restart
-#   lc reload              # restart only (after manual config edit)
 #   lc shell               # open a shell inside the container
 #
 # HTTP helpers (auto-inject the master key from .env):
@@ -124,6 +127,12 @@ case "$cmd" in
     ;;
   restart|reload)
     docker restart "$CONTAINER"
+    ;;
+  recreate)
+    # Use compose so .env + compose-file env vars are re-evaluated.
+    cd "$REPO_DIR"
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+      up -d --force-recreate litellm
     ;;
   edit)
     "${EDITOR:-nano}" "$CONFIG_FILE"
