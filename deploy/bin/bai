@@ -191,8 +191,8 @@ cmd_init() {
   "channels": {
     "slack": {
       "mode": "socket",
-      "botToken":  { "source": "env", "provider": "default", "id": "SLACK_BOT_TOKEN" },
-      "appToken":  { "source": "env", "provider": "default", "id": "SLACK_APP_TOKEN" },
+      "botToken":  "${SLACK_BOT_TOKEN}",
+      "appToken":  "${SLACK_APP_TOKEN}",
       "dmPolicy":  "allowlist",
       "allowFrom": ["accessGroup:admins", "accessGroup:operators", "accessGroup:viewers"],
       "dm":          { "enabled": true, "groupEnabled": false },
@@ -329,6 +329,12 @@ tier_add() {
   local prefixed
   prefixed="$(prefixed_slack_id "$uid")"
 
+  # Sync-channels-slack-allowFrom helper: regenerate as the union of all
+  # tier accessGroup members. Some OpenClaw builds do NOT expand
+  # "accessGroup:" references in channels.slack.allowFrom at runtime,
+  # which silently blocks all DMs. Listing literal user IDs always works.
+  # We re-derive this after every add/remove.
+
   # Detect existing tier(s) before mutating, for the report.
   local previous=""
   for t in "${TIERS[@]}"; do
@@ -365,6 +371,13 @@ tier_add() {
         agentId: $agent,
         match: { channel: "slack", peer: { kind: "direct", id: $uid } }
       }] + .
+    # Sync channels.slack.allowFrom to the union of all tier members
+    # (literal IDs only — accessGroup: refs may not expand at runtime).
+    | .channels.slack.allowFrom = (
+        ((.accessGroups.admins.members.slack    // []) +
+         (.accessGroups.operators.members.slack // []) +
+         (.accessGroups.viewers.members.slack   // []))
+        | unique)
   ' \
     --arg tier     "$tier" \
     --arg uid      "$uid" \
@@ -418,6 +431,12 @@ tier_remove() {
         or (.match.peer.kind // "") != "direct"
         or (.match.peer.id // "")   != $uid
       )))
+    # Re-sync channels.slack.allowFrom to the remaining union of all tiers.
+    | .channels.slack.allowFrom = (
+        ((.accessGroups.admins.members.slack    // []) +
+         (.accessGroups.operators.members.slack // []) +
+         (.accessGroups.viewers.members.slack   // []))
+        | unique)
   ' \
     --arg tier     "$tier" \
     --arg uid      "$uid" \
@@ -621,18 +640,13 @@ cmd_migrate() {
     | if (.commands.ownerDisplaySecret // null | type) == "object"
       then .commands.ownerDisplaySecret = "REPLACE_WITH_OWNER_DISPLAY_HMAC_KEY"
       else . end
-    | if (.channels.slack.botToken // null | type) == "object"
-         and (.channels.slack.botToken | has("secret"))
-      then .channels.slack.botToken = {
-        source: "env", provider: "default", id: .channels.slack.botToken.secret
-      }
-      else . end
-    | if (.channels.slack.appToken // null | type) == "object"
-         and (.channels.slack.appToken | has("secret"))
-      then .channels.slack.appToken = {
-        source: "env", provider: "default", id: .channels.slack.appToken.secret
-      }
-      else . end
+    # botToken / appToken: leave the value alone here. We will INLINE the
+    # real token string from the container env vars in a post-jq step below
+    # (literal strings are the only form OpenClaw resolves reliably across
+    # builds — env-substitution "${VAR}" and {source:"env",...} SecretRef
+    # both depend on machinery that this Minimus build does not always wire).
+    # The post-step pulls SLACK_BOT_TOKEN / SLACK_APP_TOKEN from the running
+    # gateway container and replaces any object/placeholder values.
     | if (.channels.slack.execApprovals.enabled // null) == "auto"
       then .channels.slack.execApprovals |= del(.enabled)
       else . end
@@ -649,6 +663,17 @@ cmd_migrate() {
     #     accepts "message.senders" | "discord.channelAudience").
     | .accessGroups = ((.accessGroups // {}) | with_entries(
         .value.type = "message.senders"))
+    # 10b. channels.slack.allowFrom: replace "accessGroup:*" refs with the
+    #      literal union of all tier members. Some builds do not expand the
+    #      "accessGroup:" tokens at runtime in the slack DM allowlist gate,
+    #      which silently rejects every DM. Literal IDs always work.
+    | if (.channels.slack.allowFrom // [] | map(select(type == "string" and startswith("accessGroup:"))) | length) > 0
+      then .channels.slack.allowFrom = (
+        ((.accessGroups.admins.members.slack    // []) +
+         (.accessGroups.operators.members.slack // []) +
+         (.accessGroups.viewers.members.slack   // []))
+        | unique)
+      else . end
     # 11. Ensure the three tier agents exist. Append any of admin/ops/view that
     #     are missing — with the same shapes as the init skeleton. Existing
     #     entries (whatever the user has tweaked) are kept untouched.
@@ -768,8 +793,24 @@ cmd_bootstrap() {
     openclaw agents add "$agent" || die "openclaw agents add $agent failed"
     echo
   done
-  echo "bai: bootstrap done. Restart the gateway to pick up the new workspace files:"
-  echo "     openclaw gateway restart"
+
+  # 'openclaw agents add' stamps each new agent with the wizard's default
+  # model (often claude-opus-4-6), which overrides whatever global default
+  # is actually configured in litellm. That's the most common cause of
+  # "agent registered but never responds". Strip those explicit overrides
+  # so the tier agents inherit the same model as 'main'.
+  echo "bai: stripping per-agent model overrides on tier agents (inherit global default)"
+  write_json '
+    .agents.list |= map(
+      if (.id == "admin" or .id == "ops" or .id == "view")
+      then del(.model) else . end
+    )
+  '
+
+  echo
+  echo "bai: bootstrap done."
+  echo "     Restart the gateway to pick up the new workspace files + agent registrations:"
+  echo "     bai reload      # full container restart (recommended)"
 }
 
 # --- subcommand: reload ---
