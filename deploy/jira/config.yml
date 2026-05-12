@@ -9,7 +9,12 @@
 # Field reference: https://github.com/ankitpokhrel/jira-cli
 
 installation: cloud
-server: https://everafterai.atlassian.net
+# Scoped API tokens (ATATT3*) must be sent to Atlassian's gateway, not the
+# site URL. The cloud ID below is fetched once from
+#   https://everafterai.atlassian.net/_edge/tenant_info
+# and is stable per workspace. Classic tokens would also work against
+# https://everafterai.atlassian.net, but scoped tokens require the gateway.
+server: https://api.atlassian.com/ex/jira/a0387066-872e-48c3-b584-a3641633c0a3
 login: shai@everafter.ai
 project:
   key: EV
