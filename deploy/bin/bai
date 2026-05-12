@@ -161,7 +161,7 @@ cmd_init() {
       {
         "id": "ops",
         "workspace": "~/.openclaw/workspace-ops",
-        "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "rw" },
+        "sandbox": { "mode": "off" },
         "tools": {
           "allow": ["read","write","edit","browser","sessions_send","group:memory"],
           "deny":  ["exec","apply_patch","gateway","cron"]
@@ -172,7 +172,7 @@ cmd_init() {
         "id": "view",
         "default": true,
         "workspace": "~/.openclaw/workspace-view",
-        "sandbox": { "mode": "all", "scope": "agent", "workspaceAccess": "ro" },
+        "sandbox": { "mode": "off" },
         "tools": {
           "allow": ["read","browser","group:memory"],
           "deny":  ["write","edit","exec","apply_patch","sessions_send","gateway","cron"]
@@ -674,6 +674,13 @@ cmd_migrate() {
          (.accessGroups.viewers.members.slack   // []))
         | unique)
       else . end
+    # 10c. Tier agents: force sandbox.mode = "off". The Minimus container
+    #      ships without a Docker CLI, so sandbox.mode = "all" / "non-main"
+    #      throws "Sandbox mode requires Docker" and the agent never runs.
+    #      tools.allow/deny is the real boundary; sandbox was defense-in-depth.
+    | .agents.list = (.agents.list // [] | map(
+        if (.id == "admin" or .id == "ops" or .id == "view")
+        then .sandbox = { mode: "off" } else . end))
     # 11. Ensure the three tier agents exist. Append any of admin/ops/view that
     #     are missing — with the same shapes as the init skeleton. Existing
     #     entries (whatever the user has tweaked) are kept untouched.
@@ -695,7 +702,7 @@ cmd_migrate() {
           {
             id: "ops",
             workspace: "~/.openclaw/workspace-ops",
-            sandbox: { mode: "all", scope: "agent", workspaceAccess: "rw" },
+            sandbox: { mode: "off" },
             tools: {
               allow: ["read","write","edit","browser","sessions_send","group:memory"],
               deny: ["exec","apply_patch","gateway","cron"]
@@ -706,7 +713,7 @@ cmd_migrate() {
             id: "view",
             default: true,
             workspace: "~/.openclaw/workspace-view",
-            sandbox: { mode: "all", scope: "agent", workspaceAccess: "ro" },
+            sandbox: { mode: "off" },
             tools: {
               allow: ["read","browser","group:memory"],
               deny: ["write","edit","exec","apply_patch","sessions_send","gateway","cron"]

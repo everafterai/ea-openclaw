@@ -1,0 +1,22 @@
+# jira-cli config — baked into the image at /etc/jira/.config.yml.
+# Referenced by JIRA_CONFIG_FILE (set in docker-compose.yml).
+#
+# Token is NOT stored here. The agent reads JIRA_API_TOKEN from the
+# container env at runtime (sourced from .env on the EC2 host).
+#
+# To regenerate from scratch, run `jira init` against a Jira workspace
+# and paste the resulting YAML over this file (minus the api_token).
+# Field reference: https://github.com/ankitpokhrel/jira-cli
+
+installation: cloud
+server: https://CHANGE-ME.atlassian.net
+login: change-me@example.com
+project:
+  key: CHANGE-ME
+  type: classic
+epic:
+  name: customfield_10001
+  link: customfield_10000
+issue:
+  fields:
+    custom: []

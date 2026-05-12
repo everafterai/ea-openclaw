@@ -19,6 +19,13 @@ ARG OPENCLAW_NODE_BOOKWORM_SLIM_DIGEST="sha256:e8e2e91b1378f83c5b2dd15f0247f3411
 # To update: docker buildx imagetools inspect oven/bun:<version> and use the manifest-list digest.
 ARG OPENCLAW_BUN_IMAGE="oven/bun:1.3.13@sha256:87416c977a612a204eb54ab9f3927023c2a3c971f4f345a01da08ea6262ae30e"
 
+# jira-cli (ankitpokhrel/jira-cli) — single static Go binary, per-arch tarballs.
+# To upgrade: bump JIRA_CLI_VERSION and refresh checksums from
+#   https://github.com/ankitpokhrel/jira-cli/releases/download/v<VER>/jira_<VER>_checksums.txt
+ARG JIRA_CLI_VERSION=1.7.0
+ARG JIRA_CLI_SHA256_AMD64=b5e0ba4804f3f11f92c483d9a6ea9ebccec1c735cd2e12b0440cab9d7afd626a
+ARG JIRA_CLI_SHA256_ARM64=80aa3cc02790892b29e1580a8e49eb49a6550815b362c5ef8c05aea1dee73a95
+
 # Base images are pinned to SHA256 digests for reproducible builds.
 # Dependabot refreshes these blessed digests; release builds consume the
 # reviewed base snapshot instead of mutating distro state on every build.
@@ -38,6 +45,31 @@ RUN --mount=type=bind,source=${OPENCLAW_BUNDLED_PLUGIN_DIR},target=/tmp/${OPENCL
         cp "/tmp/${OPENCLAW_BUNDLED_PLUGIN_DIR}/$ext/package.json" "/out/$ext/package.json"; \
       fi; \
     done
+
+# ── jira-cli fetch + verify ────────────────────────────────────
+# Fetched in an isolated stage so the runtime image never holds the tarball.
+# Output: /out/jira (static binary, +x).
+FROM debian:12-slim AS jira-cli
+ARG JIRA_CLI_VERSION
+ARG JIRA_CLI_SHA256_AMD64
+ARG JIRA_CLI_SHA256_ARM64
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) arch_slug=linux_x86_64; sha="${JIRA_CLI_SHA256_AMD64}";; \
+      arm64) arch_slug=linux_arm64;  sha="${JIRA_CLI_SHA256_ARM64}";; \
+      *) echo "ERROR: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1;; \
+    esac; \
+    curl -fsSL -o /tmp/jira.tar.gz \
+      "https://github.com/ankitpokhrel/jira-cli/releases/download/v${JIRA_CLI_VERSION}/jira_${JIRA_CLI_VERSION}_${arch_slug}.tar.gz"; \
+    echo "${sha}  /tmp/jira.tar.gz" | sha256sum -c -; \
+    mkdir -p /out /tmp/jira-extract; \
+    tar -xzf /tmp/jira.tar.gz -C /tmp/jira-extract; \
+    cp "/tmp/jira-extract/jira_${JIRA_CLI_VERSION}_${arch_slug}/bin/jira" /out/jira; \
+    chmod +x /out/jira
 
 # ── Stage 2: Build ──────────────────────────────────────────────
 FROM ${OPENCLAW_BUN_IMAGE} AS bun-binary
@@ -256,6 +288,16 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         docker-ce-cli docker-compose-plugin; \
     fi
+
+# jira-cli binary + baked config.
+# Token is NOT baked in — JIRA_API_TOKEN comes from container env at runtime.
+# JIRA_CONFIG_FILE in docker-compose.yml points jira-cli at the path below;
+# we use /etc/jira/ instead of $XDG_CONFIG_HOME because that home is the
+# bind-mounted state volume and would mask any file we baked under it.
+COPY --from=jira-cli /out/jira /usr/local/bin/jira
+RUN chmod 755 /usr/local/bin/jira
+COPY deploy/jira/config.yml /etc/jira/.config.yml
+RUN chmod 644 /etc/jira/.config.yml
 
 # Expose the CLI binary without requiring npm global writes as non-root.
 RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \

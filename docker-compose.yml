@@ -35,6 +35,11 @@ services:
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY:-}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE:-}
       TZ: ${OPENCLAW_TZ:-UTC}
+      # jira-cli: config is baked at /etc/jira/.config.yml; token comes from .env
+      # on the EC2 host (gitignored). Empty default keeps compose interpolation
+      # quiet when the var is unset.
+      JIRA_CONFIG_FILE: /etc/jira/.config.yml
+      JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-${HOME:-/tmp}/.openclaw}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR:-${HOME:-/tmp}/.openclaw/workspace}:/home/node/.openclaw/workspace
@@ -109,6 +114,8 @@ services:
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY:-}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE:-}
       TZ: ${OPENCLAW_TZ:-UTC}
+      JIRA_CONFIG_FILE: /etc/jira/.config.yml
+      JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
     volumes:
       - ${OPENCLAW_CONFIG_DIR:-${HOME:-/tmp}/.openclaw}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR:-${HOME:-/tmp}/.openclaw/workspace}:/home/node/.openclaw/workspace
