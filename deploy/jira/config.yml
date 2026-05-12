@@ -9,10 +9,10 @@
 # Field reference: https://github.com/ankitpokhrel/jira-cli
 
 installation: cloud
-server: https://CHANGE-ME.atlassian.net
-login: change-me@example.com
+server: https://everafterai.atlassian.net
+login: shai@everafter.ai
 project:
-  key: CHANGE-ME
+  key: EV
   type: classic
 epic:
   name: customfield_10001
