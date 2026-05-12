@@ -76,6 +76,13 @@ services:
   # binding; openclaw-gateway reaches it at http://litellm:4000 via the
   # default compose network. Self-hosted from upstream OSS image; no data
   # leaves the VPC except through the existing Vertex subprocessor path.
+  #
+  # Cost tracking: enabled via the `litellm-db` Postgres sidecar below.
+  # LiteLLM persists per-request spend rows there and exposes:
+  #   /spend/logs, /global/spend/report, /user/daily/activity, /user/info.
+  # Without DATABASE_URL set, these endpoints 404 or return nothing — that
+  # was the original cause of `lc spend` showing no data. Prisma migrations
+  # run automatically on startup when DATABASE_URL is present.
   # ----------------------------------------------------------------------
   litellm:
     # Pin to a specific tag for reproducibility. Bump deliberately; do NOT
@@ -93,6 +100,14 @@ services:
       # in `.env` (never commit). On EC2:
       #   echo "LITELLM_MASTER_KEY=sk-$(openssl rand -hex 24)" >> .env
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set in .env}
+      # Encryption key for stored API credentials. Cannot be rotated after
+      # deployment without rewriting encrypted rows. Generate once:
+      #   echo "LITELLM_SALT_KEY=sk-$(openssl rand -hex 24)" >> .env
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?LITELLM_SALT_KEY must be set in .env}
+      # Spend tracking backend. Internal-only Postgres; never reached from
+      # outside the compose network.
+      DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD:?LITELLM_DB_PASSWORD must be set in .env}@litellm-db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
     command:
       - "--config"
       - "/etc/litellm/config.yaml"
@@ -100,6 +115,9 @@ services:
       - "4000"
       - "--num_workers"
       - "1"
+    depends_on:
+      litellm-db:
+        condition: service_healthy
     # Internal-only — never expose 4000 on the host.
     expose:
       - "4000"
@@ -110,10 +128,41 @@ services:
       interval: 10s
       timeout: 3s
       retries: 12
-      start_period: 30s
+      start_period: 60s
     deploy:
       resources:
         limits:
           cpus: "0.5"
           memory: 512M
     restart: unless-stopped
+
+  # ----------------------------------------------------------------------
+  # Postgres backing store for LiteLLM spend tracking + key/team metadata.
+  # Internal-only: never bind 5432 to the host. Data persists in the named
+  # volume `litellm_db_data` so spend history survives `docker compose down`.
+  # ----------------------------------------------------------------------
+  litellm-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${LITELLM_DB_PASSWORD:?LITELLM_DB_PASSWORD must be set in .env}
+      POSTGRES_DB: litellm
+    volumes:
+      - litellm_db_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    restart: unless-stopped
+
+volumes:
+  litellm_db_data:

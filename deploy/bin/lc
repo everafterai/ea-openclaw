@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lc — LiteLLM control shim for the dockerized litellm sidecar.
 #
-# Usage:
+# Container management:
 #   lc                     # status (alias for `lc ps`)
 #   lc ps                  # container status
 #   lc logs [args...]      # follow logs (passes args to `docker logs`)
@@ -17,9 +17,17 @@
 #   lc health              # GET /health/liveliness
 #   lc ready               # GET /health/readiness
 #   lc models              # GET /v1/models
-#   lc spend               # GET /spend
 #   lc test <model> [msg]  # POST /v1/chat/completions (default msg: "Hello")
 #   lc curl <path> [args]  # arbitrary authenticated GET against the proxy
+#
+# Spend tracking (requires DATABASE_URL configured — see compose):
+#   lc spend               # today's totals + per-model breakdown
+#   lc spend today         # alias for `lc spend`
+#   lc spend month         # month-to-date daily breakdown
+#   lc spend range <s> <e> # daily breakdown, dates YYYY-MM-DD
+#   lc spend report [s] [e]# /global/spend/report (default: MTD, by api_key)
+#   lc spend logs [s] [e]  # individual /spend/logs rows (default: today)
+#   lc spend raw [s] [e]   # raw /user/daily/activity JSON dump
 #
 # Raw passthrough:
 #   lc exec <cmd...>       # docker exec into the litellm container
@@ -61,6 +69,9 @@ ensure_running() {
   fi
 }
 
+today_utc()      { date -u +%Y-%m-%d; }
+month_start_utc(){ date -u +%Y-%m-01; }
+
 http_get() {
   local path="$1"; shift || true
   load_key
@@ -73,7 +84,7 @@ req = urllib.request.Request(
     headers={"Authorization": "Bearer " + os.environ["LC_KEY"]},
 )
 try:
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=30) as r:
         sys.stdout.write(r.read().decode("utf-8", "replace"))
         sys.stdout.write("\n")
 except urllib.error.HTTPError as e:
@@ -114,6 +125,78 @@ except Exception as e:
 '
 }
 
+# Format /user/daily/activity JSON (read from stdin) into a readable
+# per-day + per-model table. Uses `python3 -c` so the script source does
+# not consume stdin — the JSON pipe must remain available to sys.stdin.
+# Avoids f-string quote escaping by using str.format throughout (the outer
+# shell layer is single-quoted).
+format_daily_activity() {
+  python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw:
+    print("(empty response)"); sys.exit(0)
+try:
+    data = json.loads(raw)
+except Exception:
+    print(raw); sys.exit(0)
+
+results = data.get("results") or []
+meta = data.get("metadata") or {}
+
+if not results:
+    print("No spend recorded in this range.")
+    print("(If you expected data: confirm DATABASE_URL is set and that")
+    print(" requests have run since the DB was wired in.)")
+    sys.exit(0)
+
+def usd(x): return "${:,.4f}".format(float(x))
+def num(x): return "{:,}".format(int(x))
+
+ROW = "{:<12}{:>12}{:>12}{:>14}{:>14}"
+print(ROW.format("Date","Spend","Requests","Prompt tok","Compl tok"))
+print("-" * 64)
+for row in results:
+    m = row.get("metrics") or {}
+    print(ROW.format(
+        row.get("date",""),
+        usd(m.get("spend",0)),
+        num(m.get("api_requests",0)),
+        num(m.get("prompt_tokens",0)),
+        num(m.get("completion_tokens",0)),
+    ))
+print("-" * 64)
+print(ROW.format(
+    "TOTAL",
+    usd(meta.get("total_spend",0)),
+    num(meta.get("total_api_requests",0)),
+    num(meta.get("total_prompt_tokens",0)),
+    num(meta.get("total_completion_tokens",0)),
+))
+
+models_total = {}
+for row in results:
+    bd = (row.get("breakdown") or {}).get("models") or {}
+    for name, info in bd.items():
+        metrics = info.get("metrics") if isinstance(info, dict) else None
+        if metrics is None and isinstance(info, dict):
+            metrics = info
+        if not isinstance(metrics, dict):
+            continue
+        agg = models_total.setdefault(name, {"spend": 0.0, "req": 0})
+        agg["spend"] += float(metrics.get("spend", 0) or 0)
+        agg["req"]   += int(metrics.get("api_requests", 0) or 0)
+
+if models_total:
+    print()
+    MROW = "{:<40}{:>12}{:>12}"
+    print(MROW.format("Model","Spend","Requests"))
+    print("-" * 64)
+    for name, agg in sorted(models_total.items(), key=lambda kv: -kv[1]["spend"]):
+        print(MROW.format(name[:40], usd(agg["spend"]), num(agg["req"])))
+'
+}
+
 # --- subcommands ---
 cmd="${1:-ps}"
 shift || true
@@ -151,7 +234,47 @@ case "$cmd" in
     http_get /v1/models | python3 -m json.tool 2>/dev/null || true
     ;;
   spend)
-    http_get /spend ;;
+    sub="${1:-today}"; shift || true
+    case "$sub" in
+      today)
+        d="$(today_utc)"
+        http_get "/user/daily/activity?start_date=${d}&end_date=${d}" | format_daily_activity
+        ;;
+      month)
+        s="$(month_start_utc)"; e="$(today_utc)"
+        http_get "/user/daily/activity?start_date=${s}&end_date=${e}" | format_daily_activity
+        ;;
+      range)
+        s="${1:-}"; e="${2:-}"
+        if [[ -z "$s" || -z "$e" ]]; then
+          echo "Usage: lc spend range <YYYY-MM-DD> <YYYY-MM-DD>" >&2; exit 2
+        fi
+        http_get "/user/daily/activity?start_date=${s}&end_date=${e}" | format_daily_activity
+        ;;
+      report)
+        s="${1:-$(month_start_utc)}"; e="${2:-$(today_utc)}"
+        http_get "/global/spend/report?start_date=${s}&end_date=${e}&group_by=api_key" \
+          | python3 -m json.tool 2>/dev/null || true
+        ;;
+      logs)
+        s="${1:-$(today_utc)}"; e="${2:-$(today_utc)}"
+        http_get "/spend/logs?start_date=${s}&end_date=${e}" \
+          | python3 -m json.tool 2>/dev/null || true
+        ;;
+      raw)
+        s="${1:-$(today_utc)}"; e="${2:-$(today_utc)}"
+        http_get "/user/daily/activity?start_date=${s}&end_date=${e}" \
+          | python3 -m json.tool 2>/dev/null || true
+        ;;
+      -h|--help|help)
+        sed -n '/^# Spend tracking/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+      *)
+        echo "lc spend: unknown subcommand '$sub' (try: today, month, range, report, logs, raw)" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   test)
     model="${1:-}"; shift || true
     msg="${*:-Hello — what model are you?}"
@@ -179,7 +302,7 @@ print(json.dumps({"model": sys.argv[1], "messages": [{"role": "user", "content":
     exec docker exec -it "$CONTAINER" litellm "$@"
     ;;
   -h|--help|help)
-    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "lc: unknown command '$cmd' (try: lc help)" >&2
