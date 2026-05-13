@@ -31,7 +31,7 @@ services:
         # web-search providers like searxng must be listed explicitly here.
         # Comma- or space-separated extension directory names. Anything in
         # package.json's `files` exclude list is also dropped unless named.
-        OPENCLAW_EXTENSIONS: ${OPENCLAW_EXTENSIONS:-searxng}
+        OPENCLAW_EXTENSIONS: ${OPENCLAW_EXTENSIONS:-searxng,codex}
     volumes:
       # Workspace-authored skills land in this repo dir so they can be
       # `git add`ed and pushed. Bundled skills (image-baked) stay under
