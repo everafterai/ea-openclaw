@@ -1,0 +1,43 @@
+# SearXNG settings for the OpenClaw internal search service.
+#
+# Bind-mounted into the `searxng` container at /etc/searxng/settings.yml by
+# docker-compose.prod.yml. The official searxng/searxng image's entrypoint
+# substitutes the literal string `ultrasecretkey` below with $SEARXNG_SECRET
+# at container startup, so the placeholder is intentional.
+#
+# JSON format MUST stay enabled under `search.formats` — the bundled
+# `searxng` OpenClaw plugin (extensions/searxng) calls SearXNG's `format=json`
+# endpoint, not HTML scraping. See docs/tools/searxng-search.md.
+
+use_default_settings: true
+
+general:
+  instance_name: "OpenClaw Search"
+  enable_metrics: false
+  donation_url: false
+  contact_url: false
+
+server:
+  # Replaced by $SEARXNG_SECRET at container startup. Do NOT replace by hand.
+  secret_key: "ultrasecretkey"
+  # Internal-only instance — no rate limiter needed (and the limiter would
+  # need a Redis sidecar to be useful).
+  limiter: false
+  image_proxy: false
+  # Bind on all interfaces inside the container; compose network isolates it.
+  bind_address: "0.0.0.0"
+
+ui:
+  static_use_hash: true
+  default_locale: "en"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+# Use SearXNG's bundled engine defaults. To trim or tweak the engine list,
+# override individual entries here — see https://docs.searxng.org/admin/settings/settings_engine.html

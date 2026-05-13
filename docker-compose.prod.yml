@@ -164,5 +164,60 @@ services:
           memory: 256M
     restart: unless-stopped
 
+  # ----------------------------------------------------------------------
+  # SearXNG — self-hosted meta-search engine. Provides web_search results
+  # to the OpenClaw gateway via the bundled `searxng` extension plugin
+  # (extensions/searxng) without any API key.
+  #
+  # Internal-only: never bind 8080 to the host. openclaw-gateway reaches it
+  # at http://searxng:8080 via the default compose network.
+  #
+  # Wiring (apply once on EC2, in /home/ubuntu/.openclaw/openclaw.json):
+  #   "tools":   { "web": { "search": { "provider": "searxng" } } }
+  #   "plugins": { "entries": { "searxng":
+  #     { "config": { "webSearch": { "baseUrl": "http://searxng:8080" } } } } }
+  # Then `bai reload --hot` (config-only change).
+  #
+  # The searxng image's entrypoint substitutes ${SEARXNG_SECRET} into
+  # /etc/searxng/settings.yml at startup (replaces the literal placeholder
+  # `ultrasecretkey`). Generate once on EC2:
+  #   echo "SEARXNG_SECRET=$(openssl rand -hex 32)" >> .env
+  # ----------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET must be set in .env}
+      UWSGI_WORKERS: ${SEARXNG_UWSGI_WORKERS:-2}
+      UWSGI_THREADS: ${SEARXNG_UWSGI_THREADS:-4}
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:rw
+    expose:
+      - "8080"
+    cap_drop:
+      - ALL
+    cap_add:
+      # The image's entrypoint runs `sed -i` over settings.yml and chowns
+      # cache dirs on first boot; without these the container exits before
+      # uWSGI starts.
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: unless-stopped
+
 volumes:
   litellm_db_data:
