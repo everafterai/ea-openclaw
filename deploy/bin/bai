@@ -22,6 +22,11 @@
 #   bai viewer   remove <UID>      # demote user from Viewer tier
 #   bai viewer   list              # list current viewers
 #
+#   bai name set    <UID> <name>   # store/update display name for a user
+#   bai name remove <UID>          # forget the stored name
+#   bai name get    <UID>          # print the stored name (if any)
+#   bai name list                  # print the full UID → name map
+#
 #   bai whois <UID>                # show which tier(s) a user is in
 #   bai tiers                      # summary table of all 3 tiers
 #   bai validate                   # check JSON syntax + structural sanity
@@ -47,11 +52,17 @@
 #
 # User IDs are Slack member IDs (U… or W…). Get them in Slack:
 #   click profile → "…" menu → "Copy member ID".
-# The optional [name] arg is for confirmation echo only — not stored anywhere.
+# The optional [name] arg, when supplied, is remembered in a sidecar names
+# file and shown by `bai <tier> list` / `bai whois`. Re-running add without
+# a name preserves the previously stored one.
 #
 # Environment variables:
 #   BAI_CONFIG          Override config file path
 #                       (default: $HOME/.openclaw/openclaw.json)
+#   BAI_NAMES           Override sidecar UID→name map path. Kept out of
+#                       openclaw.json because the gateway zod schema
+#                       rejects unknown keys under accessGroups.
+#                       (default: $HOME/.openclaw/bai-names.json)
 #   BAI_COMPOSE_DIR     ea-openclaw clone dir used for reload fallback
 #                       (default: $HOME/ea-openclaw)
 #
@@ -61,6 +72,7 @@ set -euo pipefail
 
 # --- locate config ---
 CONFIG_FILE="${BAI_CONFIG:-$HOME/.openclaw/openclaw.json}"
+NAMES_FILE="${BAI_NAMES:-$HOME/.openclaw/bai-names.json}"
 COMPOSE_DIR="${BAI_COMPOSE_DIR:-$HOME/ea-openclaw}"
 
 # Tier metadata (kept in sync with the design spec).
@@ -111,6 +123,30 @@ write_json() {
 
 # Resolve the canonical "slack:UID" prefix used in commands.ownerAllowFrom.
 prefixed_slack_id() { echo "slack:$1"; }
+
+# Sidecar UID → display-name map. Lives alongside openclaw.json (not inside it)
+# so the gateway's zod schema doesn't see unknown keys.
+name_for_uid() {
+  local uid="$1"
+  [[ -f "$NAMES_FILE" ]] || return 0
+  jq -r --arg u "$uid" '.[$u] // empty' "$NAMES_FILE" 2>/dev/null || true
+}
+
+remember_name() {
+  local uid="$1" name="$2"
+  [[ -z "$name" ]] && return 0
+  mkdir -p "$(dirname "$NAMES_FILE")"
+  local tmp
+  tmp="$(mktemp -t bai.names.XXXXXX)"
+  if [[ -f "$NAMES_FILE" ]]; then
+    jq --arg u "$uid" --arg n "$name" '. + {($u): $n}' "$NAMES_FILE" > "$tmp" \
+      || { rm -f "$tmp"; die "failed to update names file at $NAMES_FILE"; }
+  else
+    jq -n --arg u "$uid" --arg n "$name" '{($u): $n}' > "$tmp" \
+      || { rm -f "$tmp"; die "failed to create names file at $NAMES_FILE"; }
+  fi
+  mv "$tmp" "$NAMES_FILE"
+}
 
 # --- subcommand: init ---
 
@@ -329,6 +365,8 @@ tier_add() {
   local prefixed
   prefixed="$(prefixed_slack_id "$uid")"
 
+  remember_name "$uid" "$name"
+
   # Sync-channels-slack-allowFrom helper: regenerate as the union of all
   # tier accessGroup members. Some OpenClaw builds do NOT expand
   # "accessGroup:" references in channels.slack.allowFrom at runtime,
@@ -458,7 +496,67 @@ tier_list() {
     echo "  (none)"
     return
   fi
-  jq -r --arg t "$tier" '.accessGroups[$t].members.slack[] | "  \(.)"' "$CONFIG_FILE"
+  local uid name
+  while IFS= read -r uid; do
+    [[ -z "$uid" ]] && continue
+    name="$(name_for_uid "$uid")"
+    if [[ -n "$name" ]]; then
+      echo "  $uid  $name"
+    else
+      echo "  $uid"
+    fi
+  done < <(jq -r --arg t "$tier" '.accessGroups[$t].members.slack[]?' "$CONFIG_FILE")
+}
+
+# --- subcommand: name set|remove|get|list ---
+#
+# Manages the sidecar UID → display-name map at $NAMES_FILE. Names are not
+# stored in openclaw.json (the gateway zod schema rejects unknown keys under
+# accessGroups), but `bai <tier> list` and `bai whois` show them when known.
+cmd_name() {
+  local sub="${1:-}"
+  [[ -n "$sub" ]] || die "usage: bai name set|remove|get|list ..."
+  shift
+  case "$sub" in
+    set)
+      local uid="${1:-}" name="${2:-}"
+      [[ -n "$uid" && -n "$name" ]] || die "usage: bai name set <UID> <name>"
+      validate_user_id "$uid"
+      remember_name "$uid" "$name"
+      echo "bai: $uid → $name"
+      ;;
+    remove|rm|del)
+      local uid="${1:-}"
+      [[ -n "$uid" ]] || die "usage: bai name remove <UID>"
+      validate_user_id "$uid"
+      if [[ ! -f "$NAMES_FILE" ]]; then
+        echo "bai: no names file at $NAMES_FILE (nothing to remove)"
+        return 0
+      fi
+      local tmp
+      tmp="$(mktemp -t bai.names.XXXXXX)"
+      jq --arg u "$uid" 'del(.[$u])' "$NAMES_FILE" > "$tmp" \
+        || { rm -f "$tmp"; die "failed to update names file at $NAMES_FILE"; }
+      mv "$tmp" "$NAMES_FILE"
+      echo "bai: cleared name for $uid"
+      ;;
+    get)
+      local uid="${1:-}"
+      [[ -n "$uid" ]] || die "usage: bai name get <UID>"
+      validate_user_id "$uid"
+      local n
+      n="$(name_for_uid "$uid")"
+      if [[ -n "$n" ]]; then echo "$n"; else echo "(no name stored for $uid)"; fi
+      ;;
+    list|ls)
+      if [[ ! -f "$NAMES_FILE" ]]; then
+        echo "  (no names stored — file at $NAMES_FILE does not exist)"
+        return 0
+      fi
+      jq -r 'to_entries | sort_by(.key) | .[] | "  \(.key)  \(.value)"' "$NAMES_FILE"
+      ;;
+    *) die "unknown 'name' subcommand: $sub (try: set, remove, get, list)" ;;
+  esac
 }
 
 # --- subcommand: whois <uid> ---
@@ -470,6 +568,14 @@ cmd_whois() {
 
   local prefixed
   prefixed="$(prefixed_slack_id "$uid")"
+
+  local known_name
+  known_name="$(name_for_uid "$uid")"
+  if [[ -n "$known_name" ]]; then
+    echo "$uid ($known_name)"
+  else
+    echo "$uid"
+  fi
 
   local found=0
   for tier in "${TIERS[@]}"; do
@@ -865,7 +971,7 @@ cmd_path() { echo "$CONFIG_FILE"; }
 # --- subcommand: help ---
 
 cmd_help() {
-  sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '/^# bai — /,/^# Requires:/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- dispatch ---
@@ -904,6 +1010,7 @@ case "$cmd" in
       *)              die "unknown 'viewer' subcommand: $sub" ;;
     esac
     ;;
+  name)               cmd_name "$@" ;;
   whois)              cmd_whois "$@" ;;
   tiers)              cmd_tiers ;;
   validate|check)     cmd_validate ;;
