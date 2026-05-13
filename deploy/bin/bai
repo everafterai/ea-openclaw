@@ -47,6 +47,14 @@
 #                                  # (in-process). Fast, but does NOT re-init
 #                                  # new agents. Only use for routing/access
 #                                  # group/binding changes on existing agents.
+#   bai snapshot [path]            # write a redacted copy of openclaw.json to
+#                                  # path (default: $BAI_COMPOSE_DIR/deploy/
+#                                  # openclaw/openclaw.snapshot.json). Replaces
+#                                  # string values whose key ends in token,
+#                                  # secret, password, apikey, api_key, cookie,
+#                                  # or webhook with the literal "$REDACTED".
+#                                  # Commit the result for disaster-recovery
+#                                  # tracking; secrets stay out of git.
 #   bai path                       # print path to the config file
 #   bai help                       # this help
 #
@@ -65,6 +73,9 @@
 #                       (default: $HOME/.openclaw/bai-names.json)
 #   BAI_COMPOSE_DIR     ea-openclaw clone dir used for reload fallback
 #                       (default: $HOME/ea-openclaw)
+#   BAI_SNAPSHOT_PATH   Default destination for `bai snapshot` (default:
+#                       $BAI_COMPOSE_DIR/deploy/openclaw/openclaw.snapshot.json).
+#                       Explicit `bai snapshot <path>` arg overrides this.
 #
 # Requires: bash 4+, jq.
 
@@ -964,6 +975,61 @@ cmd_reload() {
   die "no docker-compose dir at $COMPOSE_DIR — set BAI_COMPOSE_DIR or restart manually"
 }
 
+# --- subcommand: snapshot ---
+#
+# Disaster-recovery snapshot of the live openclaw.json with secrets stripped.
+# Redacts any string value whose enclosing key (case-insensitive) ends in:
+#   token, secret, password, apikey, api_key, cookie, webhook
+# SecretRef objects (e.g. {"source":"env","id":"VAR"}) are left intact — they
+# already point at where the real value lives, not the value itself.
+
+SNAPSHOT_DEFAULT="$COMPOSE_DIR/deploy/openclaw/openclaw.snapshot.json"
+
+cmd_snapshot() {
+  require_config
+  local out="${1:-${BAI_SNAPSHOT_PATH:-$SNAPSHOT_DEFAULT}}"
+  mkdir -p "$(dirname "$out")"
+
+  local tmp
+  tmp="$(mktemp -t bai.snapshot.XXXXXX)"
+  trap 'rm -f "$tmp"' RETURN
+
+  jq '
+    def is_secret_key($k):
+      ($k | ascii_downcase) as $lk
+      | $lk | (endswith("token")
+            or endswith("secret")
+            or endswith("password")
+            or endswith("apikey")
+            or endswith("api_key")
+            or endswith("cookie")
+            or endswith("webhook"));
+
+    walk(
+      if type == "object" then
+        with_entries(
+          if (is_secret_key(.key))
+             and (.value | type) == "string"
+             and (.value | length) > 0
+          then .value = "$REDACTED"
+          else .
+          end
+        )
+      else .
+      end
+    )
+  ' "$CONFIG_FILE" > "$tmp" || die "jq redaction failed; snapshot not written"
+
+  jq -e . "$tmp" >/dev/null || die "redaction produced invalid JSON; snapshot not written"
+  mv "$tmp" "$out"
+  trap - RETURN
+
+  local n
+  n="$(jq '[.. | strings | select(. == "$REDACTED")] | length' "$out")"
+  echo "snapshot: $out"
+  echo "redacted $n value(s)"
+}
+
 # --- subcommand: path ---
 
 cmd_path() { echo "$CONFIG_FILE"; }
@@ -1017,6 +1083,7 @@ case "$cmd" in
   migrate)            cmd_migrate ;;
   bootstrap)          cmd_bootstrap ;;
   reload)             cmd_reload ;;
+  snapshot)           cmd_snapshot "$@" ;;
   path)               cmd_path ;;
   -h|--help|help)     cmd_help ;;
   *)                  die "unknown command '$cmd' (try: bai help)" ;;

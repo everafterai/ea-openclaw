@@ -1,0 +1,488 @@
+{
+  "accessGroups": {
+    "admins": {
+      "type": "message.senders",
+      "members": {
+        "slack": [
+          "U0194HAC5SB",
+          "U01SFDDP154",
+          "US7CAGYDS",
+          "US7S19JUV"
+        ]
+      }
+    },
+    "operators": {
+      "type": "message.senders",
+      "members": {
+        "slack": []
+      }
+    },
+    "viewers": {
+      "type": "message.senders",
+      "members": {
+        "slack": []
+      }
+    }
+  },
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "name": "main",
+        "workspace": "/home/node/.openclaw/workspace",
+        "agentDir": "/home/node/.openclaw/agents/main/agent"
+      },
+      {
+        "id": "admin",
+        "workspace": "~/.openclaw/workspace-admin",
+        "sandbox": {
+          "mode": "off"
+        },
+        "tools": {
+          "profile": "coding",
+          "alsoAllow": [
+            "browser",
+            "message",
+            "group:plugins"
+          ],
+          "elevated": {
+            "enabled": true
+          }
+        },
+        "systemPromptOverride": "admin: full operator-tier agent for the org. Never assume a sender is an admin without verifying their Slack user ID against the admins accessGroup.",
+        "name": "admin",
+        "agentDir": "/home/node/.openclaw/agents/admin/agent"
+      },
+      {
+        "id": "ops",
+        "workspace": "~/.openclaw/workspace-ops",
+        "sandbox": {
+          "mode": "off"
+        },
+        "tools": {
+          "profile": "coding",
+          "alsoAllow": [
+            "browser",
+            "message",
+            "group:plugins"
+          ],
+          "deny": [
+            "exec",
+            "apply_patch",
+            "gateway",
+            "cron"
+          ]
+        },
+        "systemPromptOverride": "ops: workflow-automation tier. You can draft, file, and update — but never exec shell, apply patches, or modify gateway config.",
+        "name": "ops",
+        "agentDir": "/home/node/.openclaw/agents/ops/agent"
+      },
+      {
+        "id": "view",
+        "default": true,
+        "workspace": "~/.openclaw/workspace-view",
+        "sandbox": {
+          "mode": "off"
+        },
+        "tools": {
+          "allow": [
+            "read",
+            "browser",
+            "group:web",
+            "group:memory",
+            "sessions_list",
+            "sessions_history",
+            "session_status"
+          ],
+          "deny": [
+            "write",
+            "edit",
+            "exec",
+            "apply_patch",
+            "sessions_send",
+            "gateway",
+            "cron"
+          ]
+        },
+        "systemPromptOverride": "view: read-only research/lookup tier. Refuse any state-mutating request and suggest opening a ticket via #base-ai-ops instead.",
+        "name": "view",
+        "agentDir": "/home/node/.openclaw/agents/view/agent"
+      }
+    ],
+    "defaults": {
+      "workspace": "/home/node/.openclaw/workspace",
+      "model": {
+        "primary": "litellm/gemini-3.1-pro-preview"
+      },
+      "models": {
+        "litellm/gemini-3.1-pro-preview": {},
+        "litellm/gemini-3.1-flash-lite-preview": {},
+        "litellm/claude-opus-4-6": {
+          "alias": "LiteLLM"
+        }
+      },
+      "contextInjection": "continuation-skip",
+      "bootstrapMaxChars": 10000,
+      "bootstrapTotalMaxChars": 80000
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "admin",
+      "match": {
+        "channel": "slack",
+        "peer": {
+          "kind": "direct",
+          "id": "US7S19JUV"
+        }
+      }
+    },
+    {
+      "agentId": "admin",
+      "match": {
+        "channel": "slack",
+        "peer": {
+          "kind": "direct",
+          "id": "US7CAGYDS"
+        }
+      }
+    },
+    {
+      "agentId": "admin",
+      "match": {
+        "channel": "slack",
+        "peer": {
+          "kind": "direct",
+          "id": "U0194HAC5SB"
+        }
+      }
+    },
+    {
+      "agentId": "admin",
+      "match": {
+        "channel": "slack",
+        "peer": {
+          "kind": "direct",
+          "id": "U01SFDDP154"
+        }
+      }
+    },
+    {
+      "agentId": "admin",
+      "match": {
+        "channel": "slack",
+        "peer": {
+          "kind": "channel",
+          "id": "C03B4BC9D2P"
+        }
+      }
+    }
+  ],
+  "channels": {
+    "slack": {
+      "mode": "socket",
+      "botToken": "$REDACTED",
+      "appToken": "$REDACTED",
+      "dmPolicy": "allowlist",
+      "allowFrom": [
+        "U0194HAC5SB",
+        "U01SFDDP154",
+        "US7CAGYDS",
+        "US7S19JUV"
+      ],
+      "dm": {
+        "enabled": true,
+        "groupEnabled": false
+      },
+      "groupPolicy": "allowlist",
+      "dangerouslyAllowNameMatching": false,
+      "replyToMode": "first",
+      "thread": {
+        "requireExplicitMention": true,
+        "historyScope": "thread",
+        "inheritParent": false,
+        "initialHistoryLimit": 20
+      },
+      "requireMention": true,
+      "allowBots": false,
+      "channels": {
+        "C03B4BC9D2P": {
+          "enabled": true,
+          "requireMention": true,
+          "systemPrompt": "You are in #base-ai-admin. Admin tier. Audit every exec."
+        },
+        "REPLACE_WITH_OPS_CHANNEL_ID": {
+          "enabled": true,
+          "requireMention": true,
+          "systemPrompt": "You are in #base-ai-ops. No exec, no apply_patch — refuse and suggest DMing an admin."
+        },
+        "REPLACE_WITH_ASK_CHANNEL_ID": {
+          "enabled": true,
+          "requireMention": true,
+          "systemPrompt": "You are in #base-ai-ask. Read-only Q&A on. Refuse write requests and link to #base-ai-ops."
+        }
+      },
+      "execApprovals": {
+        "approvers": [
+          "accessGroup:admins"
+        ],
+        "target": "dm"
+      },
+      "ackReaction": "eyes",
+      "typingReaction": "hourglass_flowing_sand",
+      "enabled": true
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": [
+      "slack:U0194HAC5SB",
+      "slack:U01SFDDP154",
+      "slack:US7CAGYDS",
+      "slack:US7S19JUV"
+    ],
+    "useAccessGroups": true,
+    "ownerDisplay": "raw"
+  },
+  "gateway": {
+    "mode": "local",
+    "controlUi": {
+      "allowedOrigins": [
+        "http://localhost:18789",
+        "http://127.0.0.1:18789"
+      ]
+    }
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.5.6",
+    "lastTouchedAt": "2026-05-13T13:43:00.430Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-05-13T13:43:00.343Z",
+    "lastRunVersion": "2026.5.6",
+    "lastRunCommand": "configure",
+    "lastRunMode": "local"
+  },
+  "env": {
+    "vars": {}
+  },
+  "plugins": {
+    "entries": {
+      "searxng": {
+        "config": {
+          "webSearch": {
+            "baseUrl": "http://searxng:8080"
+          }
+        }
+      },
+      "litellm": {
+        "enabled": true
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "litellm": {
+        "baseUrl": "http://litellm:4000",
+        "apiKey": "$REDACTED",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gemini-2.5-pro",
+            "name": "Gemini 2.5 Pro (Vertex via LiteLLM)"
+          },
+          {
+            "id": "gemini-2.5-flash",
+            "name": "Gemini 2.5 Flash (Vertex via LiteLLM)"
+          },
+          {
+            "id": "gemini-2.0-flash",
+            "name": "Gemini 2.0 Flash (Vertex via LiteLLM)"
+          },
+          {
+            "id": "gemini-3.1-pro-preview",
+            "name": "Gemini 3.1 Pro (Vertex via LiteLLM)"
+          },
+          {
+            "id": "gemini-3.1-flash-lite-preview",
+            "name": "Gemini 3.1 Flash (Vertex via LiteLLM)"
+          },
+          {
+            "id": "claude-opus-4-6",
+            "name": "Claude Opus 4.6",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "litellm:default": {
+        "provider": "litellm",
+        "mode": "api_key"
+      }
+    }
+  },
+  "skills": {
+    "entries": {
+      "1password": {
+        "enabled": false
+      },
+      "apple-notes": {
+        "enabled": false
+      },
+      "apple-reminders": {
+        "enabled": false
+      },
+      "bear-notes": {
+        "enabled": false
+      },
+      "blogwatcher": {
+        "enabled": false
+      },
+      "blucli": {
+        "enabled": false
+      },
+      "bluebubbles": {
+        "enabled": false
+      },
+      "camsnap": {
+        "enabled": false
+      },
+      "clawhub": {
+        "enabled": false
+      },
+      "coding-agent": {
+        "enabled": false
+      },
+      "discord": {
+        "enabled": false
+      },
+      "eightctl": {
+        "enabled": false
+      },
+      "gemini": {
+        "enabled": false
+      },
+      "gh-issues": {
+        "enabled": false
+      },
+      "gifgrep": {
+        "enabled": false
+      },
+      "github": {
+        "enabled": false
+      },
+      "gog": {
+        "enabled": false
+      },
+      "goplaces": {
+        "enabled": false
+      },
+      "himalaya": {
+        "enabled": false
+      },
+      "imsg": {
+        "enabled": false
+      },
+      "mcporter": {
+        "enabled": false
+      },
+      "model-usage": {
+        "enabled": false
+      },
+      "nano-pdf": {
+        "enabled": false
+      },
+      "notion": {
+        "enabled": false
+      },
+      "obsidian": {
+        "enabled": false
+      },
+      "openai-whisper": {
+        "enabled": false
+      },
+      "openai-whisper-api": {
+        "enabled": false
+      },
+      "openhue": {
+        "enabled": false
+      },
+      "oracle": {
+        "enabled": false
+      },
+      "ordercli": {
+        "enabled": false
+      },
+      "peekaboo": {
+        "enabled": false
+      },
+      "sag": {
+        "enabled": false
+      },
+      "session-logs": {
+        "enabled": false
+      },
+      "sherpa-onnx-tts": {
+        "enabled": false
+      },
+      "songsee": {
+        "enabled": false
+      },
+      "sonoscli": {
+        "enabled": false
+      },
+      "spotify-player": {
+        "enabled": false
+      },
+      "summarize": {
+        "enabled": false
+      },
+      "things-mac": {
+        "enabled": false
+      },
+      "tmux": {
+        "enabled": false
+      },
+      "trello": {
+        "enabled": false
+      },
+      "video-frames": {
+        "enabled": false
+      },
+      "voice-call": {
+        "enabled": false
+      },
+      "wacli": {
+        "enabled": false
+      },
+      "xurl": {
+        "enabled": false
+      }
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "provider": "searxng"
+      },
+      "fetch": {
+        "enabled": true
+      }
+    }
+  }
+}

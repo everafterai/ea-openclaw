@@ -23,22 +23,42 @@ this fork and activates lazily when `tools.web.search.provider = "searxng"`.
 These run on the EC2 box, not on your laptop. Reminder: editing files in the
 laptop clone does nothing until they reach EC2.
 
+The gateway image is what owns the bundled searxng plugin. The Dockerfile
+defaults [`OPENCLAW_EXTENSIONS=""`](../../Dockerfile#L13), which prunes most
+opt-in extensions (including web-search providers) out of `dist/extensions`
+during the runtime-assets stage. The fork's
+[docker-compose.prod.yml](../../docker-compose.prod.yml) overrides that
+default to `${OPENCLAW_EXTENSIONS:-searxng}`, so as long as you don't set
+`OPENCLAW_EXTENSIONS=` to something narrower in `.env`, the gateway image
+will keep searxng. **Without rebuilding the gateway image after pulling this
+change, `openclaw doctor` will say `plugin not found: searxng`.**
+
 ```bash
-# 1. Pull the new compose service + settings.yml from this branch.
+# 1. Pull the new compose service + settings.yml + build args.
 cd ~/ea-openclaw
 git pull
 
 # 2. Generate a SearXNG secret_key and put it in .env (one time).
 echo "SEARXNG_SECRET=$(openssl rand -hex 32)" >> .env
 
-# 3. Start the searxng container.
-dcp up -d searxng
+# 3. Rebuild the gateway image so /app/dist/extensions/searxng/ is present.
+#    Skipping this is what causes `plugin not found: searxng` from doctor.
+dcp build openclaw-gateway
 
-# 4. Confirm it is healthy (loopback only — never expose 8080 publicly).
+# 4. Start the searxng sidecar + replace the gateway container with the new
+#    image. `dcp up -d` (not `restart`) is required to pick up the rebuild.
+dcp up -d searxng openclaw-gateway
+
+# 5. Confirm the searxng container is healthy (loopback only — never expose
+#    8080 publicly).
 dcp ps searxng
 dcp logs --tail=50 searxng
 
-# 5. From inside the gateway container, prove the JSON endpoint works.
+# 6. Confirm the bundled plugin made it into the gateway image.
+dcp exec openclaw-gateway ls /app/dist/extensions/searxng/
+dcp exec openclaw-gateway node dist/index.js plugins list 2>&1 | grep searxng
+
+# 7. Prove the JSON endpoint works from inside the gateway container.
 dcp exec openclaw-gateway node -e \
   "fetch('http://searxng:8080/search?q=openclaw&format=json').then(r=>r.text()).then(t=>console.log(t.slice(0,200)))"
 ```
