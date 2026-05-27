@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { loadQaRuntimeModule } from "openclaw/plugin-sdk/qa-runner-runtime";
 import type { QaReportCheck } from "../../report.js";
@@ -47,6 +47,7 @@ type MatrixQaGatewayChild = {
   ) => Promise<void>;
   restart(): Promise<void>;
   runtimeEnv?: NodeJS.ProcessEnv;
+  workspaceDir: string;
 };
 
 const DEFAULT_MATRIX_QA_RUN_TIMEOUT_MS = 30 * 60_000;
@@ -801,6 +802,7 @@ export async function runMatrixQaLive(params: {
                 observerUserId: provisioning.observer.userId,
                 gatewayRuntimeEnv: scenarioGateway.harness.gateway.runtimeEnv,
                 gatewayStateDir: scenarioGateway.harness.gateway.runtimeEnv?.OPENCLAW_STATE_DIR,
+                gatewayWorkspaceDir: scenarioGateway.harness.gateway.workspaceDir,
                 gatewayCall: async (method, params, opts) =>
                   await scenarioGateway.harness.gateway.call(method, params ?? {}, opts),
                 outputDir,
@@ -1124,7 +1126,7 @@ export async function runMatrixQaLive(params: {
   };
 }
 
-export const __testing = {
+export const testing = {
   buildMatrixQaSummary,
   getMatrixQaScenarioRestartReadyTimeoutMs,
   scheduleMatrixQaScenariosInCatalogOrder,
@@ -1141,3 +1143,4 @@ export const __testing = {
   summarizeMatrixQaConfigSnapshot,
   waitForMatrixChannelReady,
 };
+export { testing as __testing };

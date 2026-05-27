@@ -112,7 +112,7 @@ const PLUGIN_UNINSTALL_RE =
 const OPENAI_API_DEFAULT_MODEL_REF = `${DEFAULT_PROVIDER}/${DEFAULT_MODEL}`;
 const ANTHROPIC_API_DEFAULT_MODEL_REF = "anthropic/claude-opus-4-7";
 const CLAUDE_CLI_DEFAULT_MODEL_REF = "claude-cli/claude-opus-4-7";
-const CODEX_CLI_DEFAULT_MODEL_REF = "codex-cli/gpt-5.5";
+const CODEX_APP_SERVER_DEFAULT_MODEL_REF = "openai/gpt-5.5";
 
 export function parseCrestodianOperation(input: string): CrestodianOperation {
   const trimmed = input.trim();
@@ -385,7 +385,7 @@ function chooseSetupModel(
     return { model: CLAUDE_CLI_DEFAULT_MODEL_REF, source: "Claude Code CLI" };
   }
   if (overview.tools.codex.found) {
-    return { model: CODEX_CLI_DEFAULT_MODEL_REF, source: "Codex CLI" };
+    return { model: CODEX_APP_SERVER_DEFAULT_MODEL_REF, source: "Codex app-server" };
   }
   return { source: "none" };
 }
@@ -639,17 +639,6 @@ export async function executeCrestodianOperation(
         Object.assign(cfg, next);
       },
     });
-    if (setupModel.model) {
-      const { repairCodexRuntimePluginInstallForModelSelection } =
-        await import("../commands/codex-runtime-plugin-install.js");
-      const repaired = await repairCodexRuntimePluginInstallForModelSelection({
-        cfg: result.nextConfig,
-        model: setupModel.model,
-      });
-      for (const warning of repaired.warnings) {
-        runtime.error?.(warning);
-      }
-    }
     const after = await readConfigFileSnapshot();
     await appendCrestodianAuditEntry({
       operation: "crestodian.setup",
@@ -1012,15 +1001,6 @@ export async function executeCrestodianOperation(
         Object.assign(cfg, next);
       },
     });
-    const { repairCodexRuntimePluginInstallForModelSelection } =
-      await import("../commands/codex-runtime-plugin-install.js");
-    const repaired = await repairCodexRuntimePluginInstallForModelSelection({
-      cfg: result.nextConfig,
-      model: operation.model,
-    });
-    for (const warning of repaired.warnings) {
-      runtime.error?.(warning);
-    }
     const after = await readConfigFileSnapshot();
     const { resolveAgentModelPrimaryValue } = await import("../config/model-input.js");
     const effectiveModel = resolveAgentModelPrimaryValue(result.nextConfig.agents?.defaults?.model);

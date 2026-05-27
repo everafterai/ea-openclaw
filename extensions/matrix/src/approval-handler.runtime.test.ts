@@ -21,6 +21,21 @@ type MatrixPendingPluginApprovalView = Extract<
 
 const MATRIX_APPROVAL_METADATA_KEY = "com.openclaw.approval";
 
+function expectRecordFields(value: unknown, expected: Record<string, unknown>) {
+  if (!value || typeof value !== "object") {
+    throw new Error("Expected record");
+  }
+  const actual = value as Record<string, unknown>;
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    expect(actual[key]).toEqual(expectedValue);
+  }
+  return actual;
+}
+
+function mockCall<T extends readonly unknown[]>(mock: { mock: { calls: T[] } }, index = 0) {
+  return mock.mock.calls.at(index);
+}
+
 function buildMatrixReceipt(messageIds: readonly string[], roomId = "!room:example.org") {
   return {
     primaryPlatformMessageId: messageIds[0],
@@ -74,12 +89,14 @@ function buildExecApprovalView(
     host: "gateway",
     actions: [
       {
+        kind: "decision",
         decision: "allow-once",
         label: "Allow Once",
         style: "success",
         command: "/approve req-1 allow-once",
       },
       {
+        kind: "decision",
         decision: "deny",
         label: "Deny",
         style: "danger",
@@ -107,6 +124,7 @@ function buildPluginApprovalView(
     severity: "critical",
     actions: [
       {
+        kind: "decision",
         decision: "allow-once",
         label: "Allow Once",
         style: "success",
@@ -193,25 +211,22 @@ describe("matrixApprovalNativeRuntime", () => {
       pendingPayload,
     });
 
-    expect(sendSingleTextMessage).toHaveBeenCalledWith(
-      "room:!room:example.org",
-      expect.stringContaining("echo hi"),
-      expect.objectContaining({
-        extraContent: {
-          [MATRIX_APPROVAL_METADATA_KEY]: expect.objectContaining({
-            version: 1,
-            type: "approval.request",
-            state: "pending",
-            id: "req-1",
-            kind: "exec",
-            commandText: "echo hi",
-            cwd: "/repo",
-            agentId: "agent-1",
-            allowedDecisions: ["allow-once", "deny"],
-          }),
-        },
-      }),
-    );
+    const [target, text, options] = mockCall(sendSingleTextMessage) ?? [];
+    expect(target).toBe("room:!room:example.org");
+    expect(String(text)).toContain("echo hi");
+    const extraContent = (options as { extraContent?: Record<string, unknown> } | undefined)
+      ?.extraContent;
+    expectRecordFields(extraContent?.[MATRIX_APPROVAL_METADATA_KEY], {
+      version: 1,
+      type: "approval.request",
+      state: "pending",
+      id: "req-1",
+      kind: "exec",
+      commandText: "echo hi",
+      cwd: "/repo",
+      agentId: "agent-1",
+      allowedDecisions: ["allow-once", "deny"],
+    });
   });
 
   it("delivers Matrix approval content with plugin approval fields", async () => {
@@ -246,47 +261,81 @@ describe("matrixApprovalNativeRuntime", () => {
       pendingPayload,
     });
 
-    expect(sendSingleTextMessage).toHaveBeenCalledWith(
-      "room:!room:example.org",
-      expect.stringContaining("deploy"),
-      expect.objectContaining({
-        extraContent: {
-          [MATRIX_APPROVAL_METADATA_KEY]: {
-            version: 1,
-            type: "approval.request",
-            state: "pending",
-            phase: "pending",
-            id: "plugin:req-1",
-            kind: "plugin",
-            title: "Plugin Approval Required",
-            description: "Approve the tool call.",
-            expiresAtMs: 1_000,
-            metadata: [],
-            allowedDecisions: ["allow-once"],
-            actions: [
-              {
-                decision: "allow-once",
-                label: "Allow Once",
-                style: "success",
-                command: "/approve plugin:req-1 allow-once",
-              },
-            ],
-            pluginId: "ops",
-            toolName: "deploy",
-            agentId: "agent-1",
-            severity: "critical",
-          },
+    const [target, text, options] = mockCall(sendSingleTextMessage) ?? [];
+    expect(target).toBe("room:!room:example.org");
+    expect(String(text)).toContain("deploy");
+    const extraContent = (options as { extraContent?: Record<string, unknown> } | undefined)
+      ?.extraContent;
+    expect(extraContent?.[MATRIX_APPROVAL_METADATA_KEY]).toEqual({
+      version: 1,
+      type: "approval.request",
+      state: "pending",
+      phase: "pending",
+      id: "plugin:req-1",
+      kind: "plugin",
+      title: "Plugin Approval Required",
+      description: "Approve the tool call.",
+      expiresAtMs: 1_000,
+      metadata: [],
+      allowedDecisions: ["allow-once"],
+      actions: [
+        {
+          kind: "decision",
+          decision: "allow-once",
+          label: "Allow Once",
+          style: "success",
+          command: "/approve plugin:req-1 allow-once",
         },
-      }),
-    );
-    expect(reactMessage).toHaveBeenCalledWith(
-      "!room:example.org",
-      "$plugin-approval",
-      "✅",
-      expect.objectContaining({
-        accountId: "default",
-      }),
-    );
+      ],
+      pluginId: "ops",
+      toolName: "deploy",
+      agentId: "agent-1",
+      severity: "critical",
+    });
+    expect(mockCall(reactMessage)?.[0]).toBe("!room:example.org");
+    expect(mockCall(reactMessage)?.[1]).toBe("$plugin-approval");
+    expect(mockCall(reactMessage)?.[2]).toBe("✅");
+    expectRecordFields(mockCall(reactMessage)?.[3], { accountId: "default" });
+  });
+
+  it("preserves plugin command actions in Matrix fallback text", async () => {
+    const view = buildPluginApprovalView({
+      actions: [
+        {
+          kind: "command",
+          label: "Verify with World",
+          style: "primary",
+          command: "/agentkit approve plugin:req-1 allow-once",
+        },
+        {
+          kind: "decision",
+          decision: "deny",
+          label: "Deny",
+          style: "danger",
+          command: "/approve plugin:req-1 deny",
+        },
+      ],
+    });
+    const pendingPayload = await buildPendingPayload(view);
+
+    expect(pendingPayload.text).toContain("/agentkit approve plugin:req-1 allow-once");
+    expect(pendingPayload.text).toContain("/approve plugin:req-1 deny");
+    expect(pendingPayload.text).not.toContain("/approve <id>");
+    expect(pendingPayload.extraContent[MATRIX_APPROVAL_METADATA_KEY].actions).toEqual([
+      {
+        kind: "command",
+        label: "Verify with World",
+        style: "primary",
+        command: "/agentkit approve plugin:req-1 allow-once",
+      },
+      {
+        kind: "decision",
+        decision: "deny",
+        label: "Deny",
+        style: "danger",
+        command: "/approve plugin:req-1 deny",
+      },
+    ]);
   });
 
   it("binds Matrix approval reactions before publishing option reactions", async () => {
@@ -371,7 +420,7 @@ describe("matrixApprovalNativeRuntime", () => {
     });
 
     expect(sendSingleTextMessage).toHaveBeenCalledTimes(2);
-    expect(entry).toMatchObject({
+    expectRecordFields(entry, {
       roomId: "!room:example.org",
       platformMessageIds: ["$approval"],
     });
@@ -414,12 +463,11 @@ describe("matrixApprovalNativeRuntime", () => {
     });
 
     expect(repairDirectRooms).toHaveBeenCalledTimes(2);
-    expect(prepared).toMatchObject({
-      target: {
-        to: "room:!dm:example.org",
-        roomId: "!dm:example.org",
-        threadId: undefined,
-      },
+    const preparedTarget = expectRecordFields(prepared, {});
+    expect(preparedTarget.target).toEqual({
+      to: "room:!dm:example.org",
+      roomId: "!dm:example.org",
+      threadId: undefined,
     });
   });
 
@@ -437,6 +485,7 @@ describe("matrixApprovalNativeRuntime", () => {
     const view = buildExecApprovalView({
       actions: [
         {
+          kind: "decision",
           decision: "allow-once",
           label: "Allow Once",
           style: "success",
@@ -468,23 +517,17 @@ describe("matrixApprovalNativeRuntime", () => {
       pendingPayload,
     });
 
-    expect(sendMessage).toHaveBeenCalledWith(
-      "room:!room:example.org",
-      pendingPayload.text,
-      expect.objectContaining({
-        accountId: "default",
-        extraContent: pendingPayload.extraContent,
-      }),
-    );
-    expect(reactMessage).toHaveBeenCalledWith(
-      "!room:example.org",
-      "$primary",
-      expect.any(String),
-      expect.objectContaining({
-        accountId: "default",
-      }),
-    );
-    expect(entry).toMatchObject({
+    expect(mockCall(sendMessage)?.[0]).toBe("room:!room:example.org");
+    expect(mockCall(sendMessage)?.[1]).toBe(pendingPayload.text);
+    expectRecordFields(mockCall(sendMessage)?.[2], {
+      accountId: "default",
+      extraContent: pendingPayload.extraContent,
+    });
+    expect(mockCall(reactMessage)?.[0]).toBe("!room:example.org");
+    expect(mockCall(reactMessage)?.[1]).toBe("$primary");
+    expect(typeof mockCall(reactMessage)?.[2]).toBe("string");
+    expectRecordFields(mockCall(reactMessage)?.[3], { accountId: "default" });
+    expectRecordFields(entry, {
       roomId: "!room:example.org",
       platformMessageIds: ["$primary", "$last"],
       reactionEventId: "$primary",

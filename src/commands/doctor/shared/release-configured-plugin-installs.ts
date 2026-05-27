@@ -1,5 +1,4 @@
 import { collectConfiguredAgentHarnessRuntimes } from "../../../agents/harness-runtimes.js";
-import { modelSelectionShouldEnsureCodexPlugin } from "../../../agents/openai-codex-routing.js";
 import { listPotentialConfiguredChannelPresenceSignals } from "../../../channels/config-presence.js";
 import { normalizeChatChannelId } from "../../../channels/registry.js";
 import { isChannelConfigured } from "../../../config/channel-configured.js";
@@ -7,16 +6,16 @@ import { collectConfiguredModelRefs } from "../../../config/model-refs.js";
 import { detectPluginAutoEnableCandidates } from "../../../config/plugin-auto-enable.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { compareOpenClawVersions } from "../../../config/version.js";
-import { isTruthyEnvValue } from "../../../infra/env.js";
 import { getOfficialExternalPluginCatalogEntry } from "../../../plugins/official-external-plugin-catalog.js";
 import { resolveProviderInstallCatalogEntries } from "../../../plugins/provider-install-catalog.js";
 import { resolveWebSearchInstallCatalogEntry } from "../../../plugins/web-search-install-catalog.js";
+import { normalizeNullableString as normalizeId } from "../../../shared/string-coerce.js";
 import { VERSION } from "../../../version.js";
 import { repairMissingPluginInstallsForIds } from "./missing-configured-plugin-install.js";
 import { asObjectRecord } from "./object.js";
+import { shouldDeferConfiguredPluginInstallRepair } from "./update-phase.js";
 
 export const CONFIGURED_PLUGIN_INSTALL_RELEASE_VERSION = "2026.5.2-beta.1";
-const UPDATE_IN_PROGRESS_ENV = "OPENCLAW_UPDATE_IN_PROGRESS";
 
 const AGENT_HARNESS_RUNTIME_PLUGIN_IDS: Readonly<Record<string, string>> = {
   // Codex can be selected as a harness for OpenAI models without a plugin entry.
@@ -27,10 +26,6 @@ type ReleaseConfiguredPluginIds = {
   pluginIds: string[];
   channelIds: string[];
 };
-
-function normalizeId(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
 
 function isPluginsGloballyDisabled(cfg: OpenClawConfig): boolean {
   return cfg.plugins?.enabled === false;
@@ -154,6 +149,19 @@ function collectConfiguredProviderIds(cfg: OpenClawConfig): Set<string> {
   for (const providerId of Object.keys(asObjectRecord(cfg.models?.providers) ?? {})) {
     add(providerId);
   }
+  const modelByChannel = asObjectRecord(cfg.channels?.modelByChannel);
+  for (const [providerId, channelMap] of Object.entries(modelByChannel ?? {})) {
+    add(providerId);
+    for (const modelRef of Object.values(asObjectRecord(channelMap) ?? {})) {
+      if (typeof modelRef !== "string") {
+        continue;
+      }
+      const slash = modelRef.indexOf("/");
+      if (slash > 0) {
+        add(modelRef.slice(0, slash));
+      }
+    }
+  }
   for (const { value } of collectConfiguredModelRefs(cfg, {
     includeChannelModelOverrides: false,
   })) {
@@ -181,14 +189,6 @@ function collectProviderPluginIds(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): 
     }
   }
   return [...ids].toSorted((left, right) => left.localeCompare(right));
-}
-
-function collectModelSelectedRuntimePluginIds(cfg: OpenClawConfig): string[] {
-  return collectConfiguredModelRefs(cfg).some(({ value }) =>
-    modelSelectionShouldEnsureCodexPlugin({ config: cfg, model: value }),
-  )
-    ? ["codex"]
-    : [];
 }
 
 function collectAgentHarnessRuntimePluginIds(
@@ -299,9 +299,6 @@ export function collectReleaseConfiguredPluginIds(params: {
   for (const pluginId of collectAgentHarnessRuntimePluginIds(params.cfg, env)) {
     addEligiblePluginId(params.cfg, pluginIds, pluginId);
   }
-  for (const pluginId of collectModelSelectedRuntimePluginIds(params.cfg)) {
-    addEligiblePluginId(params.cfg, pluginIds, pluginId);
-  }
   for (const pluginId of collectWebSearchPluginIds(params.cfg)) {
     addEligiblePluginId(params.cfg, pluginIds, pluginId);
   }
@@ -339,7 +336,7 @@ export async function maybeRunConfiguredPluginInstallReleaseStep(params: {
   touchedConfig: boolean;
 }> {
   const env = params.env ?? process.env;
-  const updateInProgress = isTruthyEnvValue(env[UPDATE_IN_PROGRESS_ENV]);
+  const updateInProgress = shouldDeferConfiguredPluginInstallRepair(env);
   const configured = collectReleaseConfiguredPluginIds({ cfg: params.cfg, env });
   const shouldRunReleaseStep = shouldRunConfiguredPluginInstallReleaseStep({
     currentVersion: params.currentVersion,

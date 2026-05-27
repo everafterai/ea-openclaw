@@ -4,14 +4,21 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupTempDirs, makeTempRepoRoot, writeJsonFile } from "../../test/helpers/temp-repo.js";
 
 // Delegate to the plugin-dir resolver for candidate-order policy; mock it here
-// so these tests focus on the loader's responsibility (parse package.jsons in
-// the returned dir, fall back to dist/channel-catalog.json when empty). The
+// so these tests focus on the loader's responsibility (merge
+// dist/channel-catalog.json entries with package.json metadata from the
+// returned dir). The
 // precedence policy (source vs dist-runtime vs dist, VITEST/tsx source-first,
 // isSourceCheckoutRoot detection, etc.) is exercised in
 // src/plugins/bundled-dir.test.ts and is intentionally not re-tested here.
 vi.mock("../plugins/bundled-dir.js", () => ({
   resolveBundledPluginsDir: vi.fn(),
   resolveSourceCheckoutDependencyDiagnostic: vi.fn(() => null),
+}));
+
+vi.mock("../plugins/channel-catalog-registry.js", () => ({
+  listChannelCatalogEntries: vi.fn(() => {
+    throw new Error("bundled channel catalog read must not run full plugin discovery");
+  }),
 }));
 
 // The channel-catalog.json fallback still walks package roots via
@@ -109,15 +116,16 @@ describe("listBundledChannelCatalogEntries", () => {
 
     const entries = listBundledChannelCatalogEntries();
 
-    const ids = entries.map((entry) => entry.id);
-    expect(ids).toEqual(expect.arrayContaining(["imessage", "telegram"]));
+    const ids = new Set(entries.map((entry) => entry.id));
+    expect(ids.has("imessage")).toBe(true);
+    expect(ids.has("telegram")).toBe(true);
     const telegram = entries.find((entry) => entry.id === "telegram");
     expect(telegram?.channel.docsPath).toBe("/channels/telegram");
     expect(telegram?.channel.label).toBe("Telegram");
   });
 
-  it("merges downloadable official catalog channels with bundled channels", () => {
-    const root = seedRoot("bcr-merge-official-");
+  it("merges the generated official catalog with bundled package metadata", () => {
+    const root = seedRoot("bcr-generated-official-");
     const extensionsRoot = path.join(root, "dist", "extensions");
     seedChannelPkg(path.join(extensionsRoot, "telegram", "package.json"), {
       id: "telegram",
@@ -142,7 +150,9 @@ describe("listBundledChannelCatalogEntries", () => {
     useBundledPluginsDir(extensionsRoot);
 
     const entries = listBundledChannelCatalogEntries();
-    expect(entries.map((entry) => entry.id)).toEqual(expect.arrayContaining(["qqbot", "telegram"]));
+    const ids = new Set(entries.map((entry) => entry.id));
+    expect(ids.has("qqbot")).toBe(true);
+    expect(ids.has("telegram")).toBe(true);
   });
 
   it("falls back to dist/channel-catalog.json when the resolver returns undefined", () => {

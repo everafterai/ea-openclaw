@@ -7,6 +7,7 @@ const PERIODIC_USAGE_LIMIT_RE =
 
 const HIGH_CONFIDENCE_AUTH_PERMANENT_PATTERNS = [
   /api[_ ]?key[_ ]?(?:revoked|deactivated|deleted)/i,
+  /deactivated[_ ]workspace/i,
   "key has been disabled",
   "key has been revoked",
   "account has been deactivated",
@@ -168,6 +169,7 @@ const ERROR_PATTERNS = {
     // aborted). These arrive as bare strings on the outer error and, without
     // an explicit match, the fallback chain is never attempted (#69368).
     /^terminated$/i,
+    /^stream_read_error$/i,
     /\bund_err_(?:socket|connect|headers?|body|req_content_length_mismatch|aborted|closed)\b/i,
     // pi-ai's openai-codex provider surfaces `Request failed` when the HTTP
     // response has no body and no status text (typical of Cloudflare 502s
@@ -202,6 +204,8 @@ const ERROR_PATTERNS = {
     "账户已欠费",
     // Z.ai: error 1311 = model not included in current subscription plan (#48988)
     ZAI_BILLING_CODE_1311_RE,
+    /\bcurrent\s+subscription\s+plan\b.*\b(?:does\s+not|doesn't|not)\b.*\binclude\s+access\b/i,
+    /\bmodel\b.*\bnot\s+available\b.*\bcurrent\s+plan\b/i,
   ],
   authPermanent: HIGH_CONFIDENCE_AUTH_PERMANENT_PATTERNS,
   auth: [
@@ -217,6 +221,12 @@ const ERROR_PATTERNS = {
     "messages.1.content.1.tool_use.id",
     "invalid request format",
     /tool call id was.*must be/i,
+    // Prefill-strict models (e.g. claude-opus-4-7) reject requests that end
+    // with an assistant turn. The lane must not re-queue these — the same
+    // payload will fail identically on every retry, causing an infinite loop
+    // (#79688).
+    "does not support assistant message prefill",
+    "conversation must end with a user message",
   ],
 } as const;
 

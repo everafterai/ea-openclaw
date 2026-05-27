@@ -1,5 +1,6 @@
 import { ButtonStyle } from "discord-api-types/v10";
 import type {
+  ApprovalActionView,
   ChannelApprovalCapabilityHandlerContext,
   ExecApprovalExpiredView,
   ExecApprovalPendingView,
@@ -10,10 +11,13 @@ import type {
   PluginApprovalResolvedView,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
 import { createChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-runtime";
-import type { ExecApprovalActionDescriptor } from "openclaw/plugin-sdk/approval-reply-runtime";
 import type { ExecApprovalDecision } from "openclaw/plugin-sdk/approval-runtime";
-import type { DiscordExecApprovalConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-types";
-import { logDebug, logError, normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import type {
+  DiscordExecApprovalConfig,
+  OpenClawConfig,
+} from "openclaw/plugin-sdk/config-contracts";
+import { logDebug, logError } from "openclaw/plugin-sdk/logging-core";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { shouldHandleDiscordApprovalRequest } from "./approval-shared.js";
 import { isDiscordExecApprovalClientEnabled } from "./exec-approvals.js";
 import {
@@ -43,11 +47,25 @@ type PreparedDeliveryTarget = {
   discordChannelId: string;
   recipientUserId?: string;
 };
+type DecisionApprovalActionView = ApprovalActionView & {
+  decision: ExecApprovalDecision;
+};
 
 export type DiscordApprovalHandlerContext = {
   token: string;
   config: DiscordExecApprovalConfig;
 };
+
+function isDecisionApprovalAction(
+  action: ApprovalActionView,
+): action is DecisionApprovalActionView {
+  return (
+    action.kind === "decision" &&
+    (action.decision === "allow-once" ||
+      action.decision === "allow-always" ||
+      action.decision === "deny")
+  );
+}
 
 function resolveHandlerContext(params: ChannelApprovalCapabilityHandlerContext): {
   accountId: string;
@@ -107,11 +125,11 @@ class ExecApprovalContainer extends DiscordUiContainer {
 }
 
 class ExecApprovalActionButton extends Button {
-  customId: string;
-  label: string;
-  style: ButtonStyle;
+  override customId: string;
+  override label: string;
+  override style: ButtonStyle;
 
-  constructor(params: { approvalId: string; descriptor: ExecApprovalActionDescriptor }) {
+  constructor(params: { approvalId: string; descriptor: DecisionApprovalActionView }) {
     super();
     this.customId = buildExecApprovalCustomId(params.approvalId, params.descriptor.decision);
     this.label = params.descriptor.label;
@@ -127,7 +145,7 @@ class ExecApprovalActionButton extends Button {
 }
 
 class ExecApprovalActionRow extends Row<Button> {
-  constructor(params: { approvalId: string; actions: readonly ExecApprovalActionDescriptor[] }) {
+  constructor(params: { approvalId: string; actions: readonly DecisionApprovalActionView[] }) {
     super(
       params.actions.map(
         (descriptor) => new ExecApprovalActionButton({ approvalId: params.approvalId, descriptor }),
@@ -136,11 +154,36 @@ class ExecApprovalActionRow extends Row<Button> {
   }
 }
 
-function createApprovalActionRow(view: PendingApprovalView): Row<Button> {
+function createApprovalActionRow(view: PendingApprovalView): Row<Button> | undefined {
+  const actions = view.actions.filter(isDecisionApprovalAction);
+  if (actions.length === 0) {
+    return undefined;
+  }
   return new ExecApprovalActionRow({
     approvalId: view.approvalId,
-    actions: view.actions,
+    actions,
   });
+}
+
+function isCommandOnlyApprovalAction(action: ApprovalActionView): boolean {
+  return (
+    action.kind === "command" &&
+    typeof action.command === "string" &&
+    action.command.trim().length > 0
+  );
+}
+
+function buildPluginCommandActionLines(actions: readonly ApprovalActionView[]): string[] {
+  const commandActions = actions.filter(isCommandOnlyApprovalAction);
+  if (commandActions.length === 0) {
+    return [];
+  }
+  return [
+    "### Actions",
+    ...commandActions.map(
+      (action) => `- ${action.label}: \`${formatCommandPreview(action.command.trim(), 240)}\``,
+    ),
+  ];
 }
 
 function buildApprovalMetadataLines(
@@ -227,7 +270,10 @@ function createPluginApprovalRequestContainer(params: {
     description: "A plugin action needs your approval.",
     commandPreview: formatCommandPreview(params.view.title, 700),
     commandSecondaryPreview: formatOptionalCommandPreview(params.view.description, 1000),
-    metadataLines: buildApprovalMetadataLines(params.view.metadata),
+    metadataLines: [
+      ...buildApprovalMetadataLines(params.view.metadata),
+      ...buildPluginCommandActionLines(params.view.actions),
+    ],
     actionRow: params.actionRow,
     footer: `Expires <t:${expiresAtSeconds}:R> · ID: ${params.view.approvalId}`,
     accentColor,

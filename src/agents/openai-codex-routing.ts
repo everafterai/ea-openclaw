@@ -1,61 +1,70 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeProviderId } from "./provider-id.js";
+import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
+import { normalizeEmbeddedAgentRuntime } from "./pi-embedded-runner/runtime.js";
+import { resolveProviderIdForAuth } from "./provider-auth-aliases.js";
+import { findNormalizedProviderValue, normalizeProviderId } from "./provider-id.js";
 
-const OPENAI_PROVIDER_ID = "openai";
-const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+export const OPENAI_PROVIDER_ID = "openai";
+export const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
 
 function isOfficialOpenAIBaseUrl(baseUrl: unknown): boolean {
   if (typeof baseUrl !== "string" || !baseUrl.trim()) {
     return true;
   }
-  return /^https?:\/\/api\.openai\.com(?:\/v1)?\/?$/iu.test(baseUrl.trim());
+  try {
+    const url = new URL(baseUrl.trim());
+    return (
+      url.protocol === "https:" &&
+      url.hostname.toLowerCase() === "api.openai.com" &&
+      (url.pathname === "" ||
+        url.pathname === "/" ||
+        url.pathname === "/v1" ||
+        url.pathname === "/v1/")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function openAIProviderUsesCustomBaseUrl(config: OpenClawConfig | undefined): boolean {
-  const providerConfig = config?.models?.providers?.openai;
-  return !isOfficialOpenAIBaseUrl(providerConfig?.baseUrl);
+  return !isOfficialOpenAIBaseUrl(config?.models?.providers?.openai?.baseUrl);
 }
 
 export function isOpenAIProvider(provider: string | undefined): boolean {
   return normalizeProviderId(provider ?? "") === OPENAI_PROVIDER_ID;
 }
 
-export function openAIRouteRequiresCodexRuntime(params: {
+export function isOpenAICodexProvider(provider: string | undefined): boolean {
+  return normalizeProviderId(provider ?? "") === OPENAI_CODEX_PROVIDER_ID;
+}
+
+export function openAIProviderUsesCodexRuntimeByDefault(params: {
   provider?: string;
   config?: OpenClawConfig;
 }): boolean {
-  return normalizeProviderId(params.provider ?? "") === OPENAI_CODEX_PROVIDER_ID;
+  return isOpenAIProvider(params.provider) && !openAIProviderUsesCustomBaseUrl(params.config);
 }
 
-export function modelSelectionRequiresCodexRuntime(params: {
-  model?: string;
-  config?: OpenClawConfig;
-}): boolean {
-  const model = params.model?.trim();
-  if (!model) {
-    return false;
+export function parseModelRefProvider(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
   }
-  const slashIndex = model.indexOf("/");
+  const slashIndex = value.trim().indexOf("/");
   if (slashIndex <= 0) {
-    return false;
+    return undefined;
   }
-  const provider = normalizeProviderId(model.slice(0, slashIndex));
-  return openAIRouteRequiresCodexRuntime({ provider, config: params.config });
+  return normalizeProviderId(value.trim().slice(0, slashIndex));
+}
+
+export function modelRefUsesOpenAIProvider(value: unknown): boolean {
+  return parseModelRefProvider(value) === OPENAI_PROVIDER_ID;
 }
 
 export function modelSelectionShouldEnsureCodexPlugin(params: {
   model?: string;
   config?: OpenClawConfig;
 }): boolean {
-  const model = params.model?.trim();
-  if (!model) {
-    return false;
-  }
-  const slashIndex = model.indexOf("/");
-  if (slashIndex <= 0) {
-    return false;
-  }
-  const provider = normalizeProviderId(model.slice(0, slashIndex));
+  const provider = parseModelRefProvider(params.model);
   if (provider === OPENAI_CODEX_PROVIDER_ID) {
     return true;
   }
@@ -63,14 +72,187 @@ export function modelSelectionShouldEnsureCodexPlugin(params: {
 }
 
 export function hasOpenAICodexAuthProfileOverride(value: unknown): boolean {
-  return typeof value === "string" && value.trim().toLowerCase().startsWith("openai-codex:");
+  return (
+    typeof value === "string" &&
+    normalizeOptionalLowercaseString(value)?.startsWith(`${OPENAI_CODEX_PROVIDER_ID}:`) === true
+  );
 }
 
-export function modelRefUsesOpenAIProvider(value: unknown): boolean {
-  if (typeof value !== "string") {
+function configuredOpenAIAuthOrderStartsWithCodexProfile(config: OpenClawConfig | undefined) {
+  if (!openAIProviderUsesCodexRuntimeByDefault({ provider: OPENAI_PROVIDER_ID, config })) {
     return false;
   }
-  const trimmed = value.trim();
-  const slashIndex = trimmed.indexOf("/");
-  return slashIndex > 0 && isOpenAIProvider(trimmed.slice(0, slashIndex));
+  const configuredOpenAIOrder = findNormalizedProviderValue(
+    config?.auth?.order,
+    OPENAI_PROVIDER_ID,
+  );
+  const firstProfile = configuredOpenAIOrder?.find(
+    (profileId) => typeof profileId === "string" && profileId.trim().length > 0,
+  );
+  return hasOpenAICodexAuthProfileOverride(firstProfile);
+}
+
+function configuredOpenAICodexAuthProfileExists(config: OpenClawConfig | undefined): boolean {
+  if (!openAIProviderUsesCodexRuntimeByDefault({ provider: OPENAI_PROVIDER_ID, config })) {
+    return false;
+  }
+  const configuredCodexOrder = findNormalizedProviderValue(
+    config?.auth?.order,
+    OPENAI_CODEX_PROVIDER_ID,
+  );
+  if (
+    configuredCodexOrder?.some(
+      (profileId) => typeof profileId === "string" && profileId.trim().length > 0,
+    ) === true
+  ) {
+    return true;
+  }
+  return Object.values(config?.auth?.profiles ?? {}).some(
+    (profile) => normalizeProviderId(profile?.provider ?? "") === OPENAI_CODEX_PROVIDER_ID,
+  );
+}
+
+export function shouldRouteOpenAIPiThroughCodexAuthProvider(params: {
+  provider: string;
+  harnessRuntime?: string;
+  agentHarnessId?: string;
+  authProfileProvider?: string;
+  authProfileId?: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+}): boolean {
+  if (!isOpenAIProvider(params.provider)) {
+    return false;
+  }
+  const runtime = normalizeEmbeddedAgentRuntime(params.agentHarnessId ?? params.harnessRuntime);
+  if (runtime !== "pi") {
+    return false;
+  }
+  if (!hasOpenAICodexAuthProfileOverride(params.authProfileId)) {
+    return false;
+  }
+  const aliasLookupParams = {
+    config: params.config,
+    workspaceDir: params.workspaceDir,
+  };
+  const authProfileProvider = resolveProviderIdForAuth(
+    params.authProfileProvider ?? params.authProfileId?.split(":", 1)[0] ?? "",
+    aliasLookupParams,
+  );
+  return authProfileProvider === OPENAI_CODEX_PROVIDER_ID;
+}
+
+export function listOpenAIAuthProfileProvidersForAgentRuntime(params: {
+  provider: string;
+  harnessRuntime?: string;
+  agentHarnessId?: string;
+  config?: OpenClawConfig;
+}): string[] {
+  if (!isOpenAIProvider(params.provider)) {
+    return [params.provider];
+  }
+  const runtime = normalizeEmbeddedAgentRuntime(
+    normalizeExplicitRuntimePin(params.agentHarnessId) ?? params.harnessRuntime,
+  );
+  if (runtime === "codex") {
+    return [OPENAI_CODEX_PROVIDER_ID];
+  }
+  if (runtime === "pi") {
+    if (configuredOpenAIAuthOrderStartsWithCodexProfile(params.config)) {
+      return [OPENAI_CODEX_PROVIDER_ID, OPENAI_PROVIDER_ID];
+    }
+    return [OPENAI_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID];
+  }
+  return [params.provider];
+}
+
+function normalizeExplicitRuntimePin(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) {
+    return undefined;
+  }
+  const runtime = normalizeEmbeddedAgentRuntime(value);
+  return runtime === "auto" || runtime === "default" ? undefined : runtime;
+}
+
+export function resolveOpenAIRuntimeProviderForPi(params: {
+  provider: string;
+  harnessRuntime?: string;
+  agentHarnessId?: string;
+  authProfileProvider?: string;
+  authProfileId?: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+}): string {
+  return shouldRouteOpenAIPiThroughCodexAuthProvider(params)
+    ? OPENAI_CODEX_PROVIDER_ID
+    : params.provider;
+}
+
+export function resolveSelectedOpenAIPiRuntimeProvider(params: {
+  provider: string;
+  harnessRuntime?: string;
+  agentHarnessId?: string;
+  authProfileProvider?: string;
+  authProfileId?: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+}): string {
+  if (shouldRouteOpenAIPiThroughCodexAuthProvider(params)) {
+    return OPENAI_CODEX_PROVIDER_ID;
+  }
+  const runtime = normalizeEmbeddedAgentRuntime(params.agentHarnessId ?? params.harnessRuntime);
+  if (!isOpenAIProvider(params.provider)) {
+    return params.provider;
+  }
+  if (runtime === "codex") {
+    return OPENAI_CODEX_PROVIDER_ID;
+  }
+  return runtime === "pi" &&
+    !params.authProfileId?.trim() &&
+    configuredOpenAIAuthOrderStartsWithCodexProfile(params.config)
+    ? OPENAI_CODEX_PROVIDER_ID
+    : params.provider;
+}
+
+export function resolveOpenAICompactionRuntimeProvider(params: {
+  provider: string;
+  harnessRuntime?: string;
+  agentHarnessId?: string;
+  authProfileProvider?: string;
+  authProfileId?: string;
+  config?: OpenClawConfig;
+  workspaceDir?: string;
+}): string {
+  if (shouldRouteOpenAIPiThroughCodexAuthProvider(params)) {
+    return OPENAI_CODEX_PROVIDER_ID;
+  }
+  const runtime = normalizeEmbeddedAgentRuntime(params.agentHarnessId ?? params.harnessRuntime);
+  if (!isOpenAIProvider(params.provider)) {
+    return params.provider;
+  }
+  if (
+    runtime === "codex" &&
+    (hasOpenAICodexAuthProfileOverride(params.authProfileId) ||
+      configuredOpenAIAuthOrderStartsWithCodexProfile(params.config) ||
+      configuredOpenAICodexAuthProfileExists(params.config))
+  ) {
+    return OPENAI_CODEX_PROVIDER_ID;
+  }
+  return runtime === "pi" &&
+    !params.authProfileId?.trim() &&
+    configuredOpenAIAuthOrderStartsWithCodexProfile(params.config)
+    ? OPENAI_CODEX_PROVIDER_ID
+    : params.provider;
+}
+
+export function resolveContextConfigProviderForRuntime(params: {
+  provider: string;
+  runtimeId?: string;
+}): string {
+  const provider = normalizeProviderId(params.provider);
+  const runtimeId = normalizeEmbeddedAgentRuntime(params.runtimeId);
+  if (provider === OPENAI_PROVIDER_ID && runtimeId === "codex") {
+    return OPENAI_CODEX_PROVIDER_ID;
+  }
+  return params.provider;
 }

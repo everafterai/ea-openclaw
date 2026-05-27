@@ -1,7 +1,12 @@
 import type { SourceReplyDeliveryMode } from "../../auto-reply/get-reply-options.types.js";
 import type { ReasoningLevel, ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  listActiveProcessSessionReferences,
+  type ActiveProcessSessionReference,
+} from "../bash-process-references.js";
 import type { ExecElevatedDefaults } from "../bash-tools.js";
+import { resolveSelectedOpenAIPiRuntimeProvider } from "../openai-codex-routing.js";
 import type { SkillSnapshot } from "../skills.js";
 
 export type EmbeddedCompactionRuntimeContext = {
@@ -20,6 +25,7 @@ export type EmbeddedCompactionRuntimeContext = {
   senderIsOwner?: boolean;
   senderId?: string;
   provider?: string;
+  runtimeProvider?: string;
   model?: string;
   modelFallbacksOverride?: string[];
   thinkLevel?: ThinkLevel;
@@ -28,6 +34,7 @@ export type EmbeddedCompactionRuntimeContext = {
   extraSystemPrompt?: string;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   ownerNumbers?: string[];
+  activeProcessSessions?: ActiveProcessSessionReference[];
 };
 
 /**
@@ -41,15 +48,37 @@ export function resolveEmbeddedCompactionTarget(params: {
   authProfileId?: string | null;
   defaultProvider?: string;
   defaultModel?: string;
-}): { provider: string | undefined; model: string | undefined; authProfileId: string | undefined } {
+}): {
+  provider: string | undefined;
+  runtimeProvider?: string;
+  model: string | undefined;
+  authProfileId: string | undefined;
+} {
   const provider = params.provider?.trim() || params.defaultProvider;
   const model = params.modelId?.trim() || params.defaultModel;
   const override = params.config?.agents?.defaults?.compaction?.model?.trim();
+  const resolveRuntimeProvider = (
+    targetProvider: string | undefined,
+    authProfileId: string | undefined,
+  ) => {
+    if (!targetProvider) {
+      return undefined;
+    }
+    const runtimeProvider = resolveSelectedOpenAIPiRuntimeProvider({
+      provider: targetProvider,
+      harnessRuntime: "pi",
+      authProfileId,
+      config: params.config,
+    });
+    return runtimeProvider === targetProvider ? undefined : runtimeProvider;
+  };
   if (!override) {
+    const authProfileId = params.authProfileId ?? undefined;
     return {
       provider,
+      runtimeProvider: resolveRuntimeProvider(provider, authProfileId),
       model,
-      authProfileId: params.authProfileId ?? undefined,
+      authProfileId,
     };
   }
   const slashIdx = override.indexOf("/");
@@ -62,12 +91,19 @@ export function resolveEmbeddedCompactionTarget(params: {
       overrideProvider !== (params.provider ?? "")?.trim()
         ? undefined
         : (params.authProfileId ?? undefined);
-    return { provider: overrideProvider, model: overrideModel, authProfileId };
+    return {
+      provider: overrideProvider,
+      runtimeProvider: resolveRuntimeProvider(overrideProvider, authProfileId),
+      model: overrideModel,
+      authProfileId,
+    };
   }
+  const authProfileId = params.authProfileId ?? undefined;
   return {
     provider,
+    runtimeProvider: resolveRuntimeProvider(provider, authProfileId),
     model: override,
-    authProfileId: params.authProfileId ?? undefined,
+    authProfileId,
   };
 }
 
@@ -95,6 +131,7 @@ export function buildEmbeddedCompactionRuntimeContext(params: {
   extraSystemPrompt?: string;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   ownerNumbers?: string[];
+  activeProcessSessions?: ActiveProcessSessionReference[];
 }): EmbeddedCompactionRuntimeContext {
   const resolved = resolveEmbeddedCompactionTarget({
     config: params.config,
@@ -102,6 +139,12 @@ export function buildEmbeddedCompactionRuntimeContext(params: {
     modelId: params.modelId,
     authProfileId: params.authProfileId,
   });
+  const processScopeKey = params.sessionKey?.trim();
+  const activeProcessSessions =
+    params.activeProcessSessions ??
+    listActiveProcessSessionReferences({
+      scopeKey: processScopeKey,
+    });
   return {
     sessionKey: params.sessionKey ?? undefined,
     messageChannel: params.messageChannel ?? undefined,
@@ -118,6 +161,7 @@ export function buildEmbeddedCompactionRuntimeContext(params: {
     senderIsOwner: params.senderIsOwner,
     senderId: params.senderId ?? undefined,
     provider: resolved.provider,
+    runtimeProvider: resolved.runtimeProvider,
     model: resolved.model,
     modelFallbacksOverride: params.modelFallbacksOverride,
     thinkLevel: params.thinkLevel,
@@ -126,5 +170,6 @@ export function buildEmbeddedCompactionRuntimeContext(params: {
     extraSystemPrompt: params.extraSystemPrompt,
     sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
     ownerNumbers: params.ownerNumbers,
+    ...(activeProcessSessions.length > 0 ? { activeProcessSessions } : {}),
   };
 }

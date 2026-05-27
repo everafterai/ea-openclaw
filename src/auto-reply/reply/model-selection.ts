@@ -2,10 +2,11 @@ import { resolveAgentConfig } from "../../agents/agent-scope.js";
 import { clearSessionAuthProfileOverride } from "../../agents/auth-profiles/session-override.js";
 import { resolveContextTokensForModel } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
+import { resolveAgentHarnessPolicy } from "../../agents/harness/selection.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.js";
+import { parseConfiguredModelVisibilityEntries } from "../../agents/model-selection-shared.js";
 import {
   buildConfiguredModelCatalog,
-  buildAllowedModelSet,
   modelKey,
   normalizeModelRef,
   normalizeProviderId,
@@ -13,6 +14,12 @@ import {
   resolveReasoningDefault,
   resolveThinkingDefault,
 } from "../../agents/model-selection.js";
+import {
+  RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
+  createModelVisibilityPolicy,
+  type ModelVisibilityPolicy,
+} from "../../agents/model-visibility-policy.js";
+import { listOpenAIAuthProfileProvidersForAgentRuntime } from "../../agents/openai-codex-routing.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { applyModelOverrideToSessionEntry } from "../../sessions/model-overrides.js";
@@ -22,7 +29,10 @@ export {
   resolveModelDirectiveSelection,
   type ModelDirectiveSelection,
 } from "./model-selection-directive.js";
-import { resolveStoredModelOverride } from "./stored-model-override.js";
+import {
+  isStaleHeartbeatAutoFallbackOverride,
+  resolveStoredModelOverride,
+} from "./stored-model-override.js";
 
 type ModelCatalog = ModelCatalogEntry[];
 
@@ -69,6 +79,9 @@ const modelCatalogRuntimeLoader = createLazyImportLoader(
 const sessionStoreRuntimeLoader = createLazyImportLoader(
   () => import("../../config/sessions/store.runtime.js"),
 );
+function normalizeRuntimeModelRef(provider: string, model: string) {
+  return normalizeModelRef(provider, model, RUNTIME_MODEL_VISIBILITY_NORMALIZATION);
+}
 
 function loadModelCatalogRuntime() {
   return modelCatalogRuntimeLoader.load();
@@ -76,6 +89,18 @@ function loadModelCatalogRuntime() {
 
 function loadSessionStoreRuntime() {
   return sessionStoreRuntimeLoader.load();
+}
+
+function findSelectedCatalogEntry(params: {
+  catalog?: readonly ModelCatalogEntry[];
+  provider: string;
+  model: string;
+}): ModelCatalogEntry | undefined {
+  const normalizedProvider = normalizeProviderId(params.provider);
+  return params.catalog?.find(
+    (entry) =>
+      normalizeProviderId(entry.provider) === normalizedProvider && entry.id === params.model,
+  );
 }
 
 export async function createModelSelectionState(params: {
@@ -89,12 +114,16 @@ export async function createModelSelectionState(params: {
   storePath?: string;
   defaultProvider: string;
   defaultModel: string;
+  primaryProvider?: string;
+  primaryModel?: string;
   provider: string;
   model: string;
   hasModelDirective: boolean;
+  skipStoredModelOverride?: boolean;
   /** True when heartbeat.model was explicitly resolved for this run.
    *  In that case, skip session-stored overrides so the heartbeat selection wins. */
   hasResolvedHeartbeatModelOverride?: boolean;
+  isHeartbeat?: boolean;
 }): Promise<ModelSelectionState> {
   const timingEnabled = shouldLogModelSelectionTiming();
   const startMs = timingEnabled ? Date.now() : 0;
@@ -121,13 +150,31 @@ export async function createModelSelectionState(params: {
 
   let provider = params.provider;
   let model = params.model;
+  const primaryProvider = params.primaryProvider ?? defaultProvider;
+  const primaryModel = params.primaryModel ?? defaultModel;
 
   const hasAllowlist = agentCfg?.models && Object.keys(agentCfg.models).length > 0;
+  const visibility = parseConfiguredModelVisibilityEntries({ cfg });
+  const defaultProviderVisibleByWildcard = visibility.providerWildcards.has(
+    normalizeProviderId(defaultProvider),
+  );
   const configuredModelCatalog = buildConfiguredModelCatalog({ cfg });
-  const needsModelCatalog = params.hasModelDirective;
+  const needsModelCatalog =
+    params.hasModelDirective ||
+    Boolean(
+      hasAllowlist && visibility.providerWildcards.size > 0 && !defaultProviderVisibleByWildcard,
+    );
 
   let allowedModelKeys = new Set<string>();
   let allowedModelCatalog: ModelCatalog = configuredModelCatalog;
+  let visibilityPolicy: ModelVisibilityPolicy = createModelVisibilityPolicy({
+    cfg,
+    catalog: configuredModelCatalog,
+    defaultProvider,
+    defaultModel,
+    agentId: params.agentId,
+    ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
+  });
   let modelCatalog: ModelCatalog | null = null;
   let resetModelOverride = false;
   let resetModelOverrideRef: string | undefined;
@@ -137,33 +184,48 @@ export async function createModelSelectionState(params: {
     overrideProvider: sessionEntry?.providerOverride,
     overrideModel: sessionEntry?.modelOverride,
   });
+  const directStoredModelOverride = directStoredOverride
+    ? { ...directStoredOverride, source: "session" as const }
+    : null;
+  const staleHeartbeatAutoFallbackOverride = isStaleHeartbeatAutoFallbackOverride({
+    isHeartbeat: params.isHeartbeat,
+    hasResolvedHeartbeatModelOverride: params.hasResolvedHeartbeatModelOverride,
+    sessionEntry,
+    storedOverride: directStoredModelOverride,
+    defaultProvider,
+    defaultModel,
+    primaryProvider: params.primaryProvider,
+    primaryModel: params.primaryModel,
+  });
 
   if (needsModelCatalog) {
     modelCatalog = await (await loadModelCatalogRuntime()).loadModelCatalog({ config: cfg });
     logStage("catalog-loaded", `entries=${modelCatalog.length}`);
-    const allowed = buildAllowedModelSet({
+    visibilityPolicy = createModelVisibilityPolicy({
       cfg,
       catalog: modelCatalog,
       defaultProvider,
       defaultModel,
       agentId: params.agentId,
+      ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
-    allowedModelCatalog = allowed.allowedCatalog;
-    allowedModelKeys = allowed.allowedKeys;
+    allowedModelCatalog = visibilityPolicy.allowedCatalog;
+    allowedModelKeys = visibilityPolicy.allowedKeys;
     logStage(
       "allowlist-built",
       `allowed=${allowedModelCatalog.length} keys=${allowedModelKeys.size}`,
     );
   } else if (hasAllowlist) {
-    const allowed = buildAllowedModelSet({
+    visibilityPolicy = createModelVisibilityPolicy({
       cfg,
       catalog: configuredModelCatalog,
       defaultProvider,
       defaultModel,
       agentId: params.agentId,
+      ...RUNTIME_MODEL_VISIBILITY_NORMALIZATION,
     });
-    allowedModelCatalog = allowed.allowedCatalog;
-    allowedModelKeys = allowed.allowedKeys;
+    allowedModelCatalog = visibilityPolicy.allowedCatalog;
+    allowedModelKeys = visibilityPolicy.allowedKeys;
     logStage(
       "configured-allowlist-built",
       `allowed=${allowedModelCatalog.length} keys=${allowedModelKeys.size}`,
@@ -173,15 +235,16 @@ export async function createModelSelectionState(params: {
   }
 
   if (sessionEntry && sessionStore && sessionKey && directStoredOverride) {
-    const normalizedOverride = normalizeModelRef(
+    const normalizedOverride = normalizeRuntimeModelRef(
       directStoredOverride.provider,
       directStoredOverride.model,
     );
     const key = modelKey(normalizedOverride.provider, normalizedOverride.model);
-    if (allowedModelKeys.size > 0 && !allowedModelKeys.has(key)) {
+    if (staleHeartbeatAutoFallbackOverride || !visibilityPolicy.allowsKey(key)) {
       const { updated } = applyModelOverrideToSessionEntry({
         entry: sessionEntry,
-        selection: { provider: defaultProvider, model: defaultModel, isDefault: true },
+        selection: { provider: primaryProvider, model: primaryModel, isDefault: true },
+        preserveAuthProfileOverride: staleHeartbeatAutoFallbackOverride,
       });
       if (updated) {
         sessionStore[sessionKey] = sessionEntry;
@@ -199,6 +262,23 @@ export async function createModelSelectionState(params: {
       }
     }
   }
+  if (staleHeartbeatAutoFallbackOverride) {
+    const normalizedCurrentSelection = normalizeRuntimeModelRef(provider, model);
+    const currentSelectionKey = modelKey(
+      normalizedCurrentSelection.provider,
+      normalizedCurrentSelection.model,
+    );
+    const normalizedDirectOverride = directStoredOverride
+      ? normalizeRuntimeModelRef(directStoredOverride.provider, directStoredOverride.model)
+      : null;
+    const directStoredOverrideKey = normalizedDirectOverride
+      ? modelKey(normalizedDirectOverride.provider, normalizedDirectOverride.model)
+      : undefined;
+    if (currentSelectionKey === directStoredOverrideKey) {
+      provider = primaryProvider;
+      model = primaryModel;
+    }
+  }
 
   const storedOverride = resolveStoredModelOverride({
     sessionEntry,
@@ -208,31 +288,67 @@ export async function createModelSelectionState(params: {
     defaultProvider,
   });
   // Skip stored session model override only when an explicit heartbeat.model
-  // was resolved. Heartbeat runs without heartbeat.model should still inherit
-  // the regular session/parent model override behavior.
-  const skipStoredOverride = params.hasResolvedHeartbeatModelOverride === true;
+  // was resolved. Heartbeats without heartbeat.model still inherit normal
+  // overrides unless a direct auto fallback override is stale for the current
+  // configured default.
+  const skipStoredOverride =
+    params.skipStoredModelOverride === true ||
+    params.hasResolvedHeartbeatModelOverride === true ||
+    (staleHeartbeatAutoFallbackOverride && storedOverride?.source === "session");
 
   if (storedOverride?.model && !skipStoredOverride) {
-    const normalizedStoredOverride = normalizeModelRef(
+    const normalizedStoredOverride = normalizeRuntimeModelRef(
       storedOverride.provider || defaultProvider,
       storedOverride.model,
     );
     const key = modelKey(normalizedStoredOverride.provider, normalizedStoredOverride.model);
-    if (allowedModelKeys.size === 0 || allowedModelKeys.has(key)) {
+    if (visibilityPolicy.allowsKey(key)) {
       provider = normalizedStoredOverride.provider;
       model = normalizedStoredOverride.model;
     }
   }
 
-  if (sessionEntry && sessionStore && sessionKey && sessionEntry.authProfileOverride) {
+  if (!params.hasModelDirective) {
+    const allowedInitialSelection = visibilityPolicy.resolveSelection({
+      provider,
+      model,
+    });
+    if (!allowedInitialSelection) {
+      throw new Error(
+        `Configured default model "${modelKey(provider, model)}" is not allowed by agents.defaults.models, and no allowed model is available.`,
+      );
+    }
+    provider = allowedInitialSelection.provider;
+    model = allowedInitialSelection.model;
+  }
+
+  if (
+    !params.skipStoredModelOverride &&
+    sessionEntry &&
+    sessionStore &&
+    sessionKey &&
+    sessionEntry.authProfileOverride
+  ) {
     const { ensureAuthProfileStore } = await import("../../agents/auth-profiles.runtime.js");
     const store = ensureAuthProfileStore(undefined, {
       allowKeychainPrompt: false,
     });
     logStage("auth-profile-store-loaded", `profiles=${Object.keys(store.profiles).length}`);
     const profile = store.profiles[sessionEntry.authProfileOverride];
-    const providerKey = normalizeProviderId(provider);
-    if (!profile || normalizeProviderId(profile.provider) !== providerKey) {
+    const profileProvider = profile ? normalizeProviderId(profile.provider) : undefined;
+    const harnessPolicy = resolveAgentHarnessPolicy({
+      provider,
+      modelId: model,
+      config: cfg,
+      agentId: params.agentId,
+      sessionKey,
+    });
+    const acceptedAuthProviders = listOpenAIAuthProfileProvidersForAgentRuntime({
+      provider,
+      harnessRuntime: harnessPolicy.runtime,
+      config: cfg,
+    }).map(normalizeProviderId);
+    if (!profile || !acceptedAuthProviders.includes(profileProvider ?? "")) {
       await clearSessionAuthProfileOverride({
         sessionEntry,
         sessionStore,
@@ -243,15 +359,45 @@ export async function createModelSelectionState(params: {
   }
 
   let thinkingCatalog: ModelCatalog | undefined;
+  let manifestModelCatalog: ModelCatalog | null = null;
+  const loadManifestCatalogForThinking = async () => {
+    if (manifestModelCatalog) {
+      return manifestModelCatalog;
+    }
+    const { loadManifestModelCatalog } = await loadModelCatalogRuntime();
+    manifestModelCatalog = loadManifestModelCatalog({
+      config: cfg,
+      fallbackToMetadataScan: false,
+    });
+    logStage("manifest-catalog-loaded-for-thinking", `entries=${manifestModelCatalog.length}`);
+    return manifestModelCatalog;
+  };
   const resolveThinkingCatalog = async () => {
     if (thinkingCatalog) {
       return thinkingCatalog;
     }
     let catalogForThinking =
       modelCatalog && modelCatalog.length > 0 ? modelCatalog : allowedModelCatalog;
-    const selectedCatalogEntry = catalogForThinking?.find(
-      (entry) => entry.provider === provider && entry.id === model,
-    );
+    let selectedCatalogEntry = findSelectedCatalogEntry({
+      catalog: catalogForThinking,
+      provider,
+      model,
+    });
+    // Prefer static manifest rows before cold runtime discovery. Synthetic
+    // allowlist rows know only provider/id; manifest rows can prove reasoning
+    // support without opening the Pi auth-backed model registry.
+    if (!modelCatalog && selectedCatalogEntry?.reasoning === undefined) {
+      const manifestCatalog = await loadManifestCatalogForThinking();
+      const manifestSelectedEntry = findSelectedCatalogEntry({
+        catalog: manifestCatalog,
+        provider,
+        model,
+      });
+      if (manifestSelectedEntry?.reasoning !== undefined) {
+        catalogForThinking = manifestCatalog;
+        selectedCatalogEntry = manifestSelectedEntry;
+      }
+    }
     const shouldHydrateRuntimeCatalog =
       !modelCatalog && (!selectedCatalogEntry || selectedCatalogEntry.reasoning === undefined);
     if (shouldHydrateRuntimeCatalog) {

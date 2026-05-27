@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
-import { applyDefaultModelPrimaryUpdate, loadValidConfigOrThrow, updateConfig } from "./shared.js";
+import { loadValidConfigOrThrow, updateConfig } from "./shared.js";
 
 const mocks = vi.hoisted(() => ({
   readConfigFileSnapshot: vi.fn(),
@@ -56,54 +56,41 @@ describe("models/shared", () => {
       update: { channel: "beta" },
     }));
 
-    expect(mocks.replaceConfigFile).toHaveBeenCalledWith({
-      nextConfig: expect.objectContaining({
-        update: { channel: "beta" },
-      }),
-      baseHash: "config-1",
-    });
+    expect(mocks.replaceConfigFile).toHaveBeenCalledOnce();
+    const [replaceParams] = mocks.replaceConfigFile.mock.calls[0] ?? [];
+    expect(replaceParams?.nextConfig.update).toEqual({ channel: "beta" });
+    expect(replaceParams?.baseHash).toBe("config-1");
   });
 
-  it("leaves OpenAI default model updates on the existing runtime", () => {
-    const next = applyDefaultModelPrimaryUpdate({
-      cfg: {},
-      modelRaw: "openai/gpt-5.5",
-      field: "model",
-    });
-
-    expect(next.agents?.defaults?.model).toEqual({ primary: "openai/gpt-5.5" });
-    expect(next.agents?.defaults?.agentRuntime).toBeUndefined();
-  });
-
-  it("pins OpenAI Codex default model updates to the Codex runtime", () => {
-    const next = applyDefaultModelPrimaryUpdate({
-      cfg: {},
-      modelRaw: "openai-codex/gpt-5.5",
-      field: "model",
-    });
-
-    expect(next.agents?.defaults?.model).toEqual({ primary: "openai-codex/gpt-5.5" });
-    expect(next.agents?.defaults?.agentRuntime).toEqual({ id: "codex" });
-  });
-
-  it("leaves custom OpenAI-compatible default model updates on the existing runtime", () => {
-    const next = applyDefaultModelPrimaryUpdate({
-      cfg: {
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://compatible.example.test/v1",
-              api: "openai-responses",
-              models: [],
-            },
-          },
+  it("updateConfig exposes runtime config without writing runtime defaults", async () => {
+    const sourceConfig = {
+      agents: { defaults: { models: { "anthropic/claude-sonnet-4-6": {} } } },
+    } as unknown as OpenClawConfig;
+    const runtimeConfig = {
+      agents: {
+        defaults: {
+          models: { "anthropic/claude-sonnet-4-6": { alias: "sonnet" } },
         },
       },
-      modelRaw: "openai/custom-gpt",
-      field: "model",
+    } as unknown as OpenClawConfig;
+    mocks.readConfigFileSnapshot.mockResolvedValue({
+      valid: true,
+      hash: "config-2",
+      sourceConfig,
+      runtimeConfig,
+      config: runtimeConfig,
+    });
+    mocks.replaceConfigFile.mockResolvedValue(undefined);
+
+    await updateConfig((current, context) => {
+      expect(current).toEqual(sourceConfig);
+      expect(context.runtimeConfig).toEqual(runtimeConfig);
+      return current;
     });
 
-    expect(next.agents?.defaults?.model).toEqual({ primary: "openai/custom-gpt" });
-    expect(next.agents?.defaults?.agentRuntime).toBeUndefined();
+    expect(mocks.replaceConfigFile).toHaveBeenCalledOnce();
+    const [replaceParams] = mocks.replaceConfigFile.mock.calls[0] ?? [];
+    expect(replaceParams?.nextConfig).toEqual(sourceConfig);
+    expect(replaceParams?.baseHash).toBe("config-2");
   });
 });

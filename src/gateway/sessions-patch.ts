@@ -1,15 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import {
+  normalizeInheritedToolAllowlist,
+  normalizeInheritedToolDenylist,
+} from "../agents/inherited-tool-deny.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
+import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
 import {
   resolveAllowedModelRef,
   resolveDefaultModelForAgent,
   resolveSubagentConfiguredModelSelection,
 } from "../agents/model-selection.js";
-import {
-  modelSelectionRequiresCodexRuntime,
-  modelSelectionShouldEnsureCodexPlugin,
-} from "../agents/openai-codex-routing.js";
+import { resolveProviderIdForAuth } from "../agents/provider-auth-aliases.js";
 import { normalizeGroupActivation } from "../auto-reply/group-activation.js";
 import {
   formatThinkingLevels,
@@ -70,37 +72,41 @@ function normalizeExecAsk(raw: string): "off" | "on-miss" | "always" | undefined
   return undefined;
 }
 
-async function applyCodexRuntimeForSessionModelSelection(params: {
+function shouldPreserveSessionAuthProfileOverride(params: {
   cfg: OpenClawConfig;
   entry: SessionEntry;
+  currentProvider: string;
   provider: string;
-  model: string;
-  ensurePluginInstall?: (params: { cfg: OpenClawConfig; model: string }) => Promise<{
-    warnings: string[];
-  }>;
-}): Promise<{ ok: true } | { ok: false; error: ErrorShape }> {
-  const modelRef = `${params.provider}/${params.model}`;
-  const requiresCodexRuntime = modelSelectionRequiresCodexRuntime({
-    model: modelRef,
-    config: params.cfg,
-  });
-  if (!requiresCodexRuntime) {
-    if (normalizeOptionalLowercaseString(params.entry.agentRuntimeOverride) === "codex") {
-      delete params.entry.agentRuntimeOverride;
+}): boolean {
+  const profileOverride = normalizeOptionalString(params.entry.authProfileOverride);
+  if (!profileOverride) {
+    return false;
+  }
+  const provider = normalizeOptionalLowercaseString(params.provider);
+  if (!provider) {
+    return false;
+  }
+  const resolvesToTargetProvider = (rawProvider: string | undefined): boolean => {
+    const candidate = normalizeOptionalLowercaseString(rawProvider);
+    if (!candidate) {
+      return false;
     }
-  } else {
-    params.entry.agentRuntimeOverride = "codex";
+    return (
+      resolveProviderIdForAuth(candidate, { config: params.cfg }) ===
+      resolveProviderIdForAuth(provider, { config: params.cfg })
+    );
+  };
+  const delimiterIndex = profileOverride.indexOf(":");
+  if (delimiterIndex < 0) {
+    return resolvesToTargetProvider(params.currentProvider);
   }
-  if (
-    params.ensurePluginInstall &&
-    modelSelectionShouldEnsureCodexPlugin({ model: modelRef, config: params.cfg })
-  ) {
-    await params.ensurePluginInstall({
-      cfg: params.cfg,
-      model: modelRef,
-    });
+  const profileProvider = normalizeOptionalLowercaseString(
+    profileOverride.slice(0, delimiterIndex),
+  );
+  if (!profileProvider) {
+    return false;
   }
-  return { ok: true };
+  return resolvesToTargetProvider(profileProvider);
 }
 
 function supportsSpawnLineage(storeKey: string): boolean {
@@ -129,9 +135,6 @@ export async function applySessionsPatchToStore(params: {
   storeKey: string;
   patch: SessionsPatchParams;
   loadGatewayModelCatalog?: () => Promise<ModelCatalogEntry[]>;
-  ensureCodexRuntimePluginInstall?: (params: { cfg: OpenClawConfig; model: string }) => Promise<{
-    warnings: string[];
-  }>;
 }): Promise<{ ok: true; entry: SessionEntry } | { ok: false; error: ErrorShape }> {
   const { cfg, store, storeKey, patch } = params;
   const now = Date.now();
@@ -155,12 +158,21 @@ export async function applySessionsPatchToStore(params: {
   };
 
   const existing = store[storeKey];
-  const next: SessionEntry = existing
+  const next: SessionEntry = existing?.sessionId
     ? {
         ...existing,
         updatedAt: Math.max(existing.updatedAt ?? 0, now),
       }
-    : { sessionId: randomUUID(), updatedAt: now };
+    : {
+        ...existing,
+        sessionId: randomUUID(),
+        sessionFile: undefined,
+        updatedAt: Math.max(existing?.updatedAt ?? 0, now),
+      };
+  if (existing && !existing.sessionId) {
+    delete next.label;
+    delete next.displayName;
+  }
 
   if ("spawnedBy" in patch) {
     const raw = patch.spawnedBy;
@@ -265,6 +277,46 @@ export async function applySessionsPatchToStore(params: {
         return invalid("subagentControlScope cannot be changed once set");
       }
       next.subagentControlScope = normalized;
+    }
+  }
+
+  if ("inheritedToolDeny" in patch) {
+    const raw = patch.inheritedToolDeny;
+    if (raw === null) {
+      delete next.inheritedToolDeny;
+    } else if (raw !== undefined) {
+      if (!Array.isArray(raw)) {
+        return invalid("invalid inheritedToolDeny (use an array of tool names)");
+      }
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("inheritedToolDeny is only supported for subagent:* or acp:* sessions");
+      }
+      const inheritedToolDeny = normalizeInheritedToolDenylist(raw);
+      if (inheritedToolDeny.length > 0) {
+        next.inheritedToolDeny = inheritedToolDeny;
+      } else {
+        delete next.inheritedToolDeny;
+      }
+    }
+  }
+
+  if ("inheritedToolAllow" in patch) {
+    const raw = patch.inheritedToolAllow;
+    if (raw === null) {
+      delete next.inheritedToolAllow;
+    } else if (raw !== undefined) {
+      if (!Array.isArray(raw)) {
+        return invalid("invalid inheritedToolAllow (use an array of tool names)");
+      }
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("inheritedToolAllow is only supported for subagent:* or acp:* sessions");
+      }
+      const inheritedToolAllow = normalizeInheritedToolAllowlist(raw);
+      if (inheritedToolAllow.length > 0) {
+        next.inheritedToolAllow = inheritedToolAllow;
+      } else {
+        delete next.inheritedToolAllow;
+      }
     }
   }
 
@@ -448,11 +500,14 @@ export async function applySessionsPatchToStore(params: {
           model: resolvedDefault.model,
           isDefault: true,
         },
+        preserveAuthProfileOverride: shouldPreserveSessionAuthProfileOverride({
+          cfg,
+          currentProvider: next.providerOverride ?? next.modelProvider ?? resolvedDefault.provider,
+          entry: next,
+          provider: resolvedDefault.provider,
+        }),
         markLiveSwitchPending: true,
       });
-      if (normalizeOptionalLowercaseString(next.agentRuntimeOverride) === "codex") {
-        delete next.agentRuntimeOverride;
-      }
     } else if (raw !== undefined) {
       const trimmed = normalizeOptionalString(raw) ?? "";
       if (!trimmed) {
@@ -471,10 +526,12 @@ export async function applySessionsPatchToStore(params: {
           error: errorShape(ErrorCodes.UNAVAILABLE, "model catalog unavailable"),
         };
       }
+      const { model: modelWithoutProfile, profile: trailingProfile } =
+        splitTrailingAuthProfile(trimmed);
       const resolved = resolveAllowedModelRef({
         cfg,
         catalog,
-        raw: trimmed,
+        raw: modelWithoutProfile,
         defaultProvider: resolvedDefault.provider,
         defaultModel: subagentModelHint ?? resolvedDefault.model,
       });
@@ -491,20 +548,15 @@ export async function applySessionsPatchToStore(params: {
           model: resolved.ref.model,
           isDefault,
         },
+        profileOverride: trailingProfile || undefined,
+        preserveAuthProfileOverride: shouldPreserveSessionAuthProfileOverride({
+          cfg,
+          currentProvider: next.providerOverride ?? next.modelProvider ?? resolvedDefault.provider,
+          entry: next,
+          provider: resolved.ref.provider,
+        }),
         markLiveSwitchPending: true,
       });
-      const runtimeApplied = await applyCodexRuntimeForSessionModelSelection({
-        cfg,
-        entry: next,
-        provider: resolved.ref.provider,
-        model: resolved.ref.model,
-        ...(params.ensureCodexRuntimePluginInstall
-          ? { ensurePluginInstall: params.ensureCodexRuntimePluginInstall }
-          : {}),
-      });
-      if (!runtimeApplied.ok) {
-        return runtimeApplied;
-      }
     }
   }
 

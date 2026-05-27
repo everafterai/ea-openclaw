@@ -28,10 +28,7 @@ import {
   INTERNAL_MESSAGE_CHANNEL,
   type InternalMessageChannel,
 } from "./message-channel-constants.js";
-import {
-  normalizeMessageChannel,
-  type DeliverableMessageChannel,
-} from "./message-channel-normalize.js";
+import { normalizeMessageChannel } from "./message-channel-normalize.js";
 
 export { GATEWAY_CLIENT_NAMES, GATEWAY_CLIENT_MODES };
 export type { GatewayClientName, GatewayClientMode };
@@ -78,7 +75,10 @@ export function isMarkdownCapableMessageChannel(raw?: string | null): boolean {
   }
   const builtInChannel = normalizeChatChannelId(channel);
   if (builtInChannel) {
-    return getChatChannelMeta(builtInChannel).markdownCapable === true;
+    const builtInMeta = getChatChannelMeta(builtInChannel);
+    if (builtInMeta) {
+      return builtInMeta.markdownCapable === true;
+    }
   }
   return getRegisteredChannelPluginMeta(channel)?.markdownCapable === true;
 }

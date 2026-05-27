@@ -1,15 +1,11 @@
-import type { Socket } from "node:net";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { connect, type Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import { describe, expect, test } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
-import {
-  A2UI_PATH,
-  CANVAS_CAPABILITY_PATH_PREFIX,
-  CANVAS_HOST_PATH,
-  CANVAS_WS_PATH,
-  type CanvasHostHandler,
-} from "../../extensions/canvas/runtime-api.js";
 import { createAuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
+import { PLUGIN_NODE_CAPABILITY_PATH_PREFIX } from "./plugin-node-capability.js";
 import { attachGatewayUpgradeHandler, createGatewayHttpServer } from "./server-http.js";
 import { createPreauthConnectionBudget } from "./server/preauth-connection-budget.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
@@ -19,6 +15,18 @@ const WS_REJECT_TIMEOUT_MS = 2_000;
 const WS_CONNECT_TIMEOUT_MS = 5_000;
 const HTTP_REQUEST_TIMEOUT_MS = 15_000;
 const SERVER_CLOSE_TIMEOUT_MS = 5_000;
+const A2UI_PATH = "/__openclaw__/a2ui";
+const CANVAS_HOST_PATH = "/__openclaw__/canvas";
+const CANVAS_WS_PATH = "/__openclaw__/ws";
+const CANVAS_CAPABILITY_PATH_PREFIX = PLUGIN_NODE_CAPABILITY_PATH_PREFIX;
+
+type CanvasHostHandler = {
+  rootDir: string;
+  basePath: string;
+  handleHttpRequest: (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
+  handleUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
+  close: () => Promise<void>;
+};
 
 async function fetchCanvas(input: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
@@ -159,6 +167,50 @@ async function expectWsConnected(url: string, headers?: Record<string, string>):
       );
     });
     ws.once("error", (err) => {
+      finish(() => reject(err));
+    });
+  });
+}
+
+async function sendRawHttpRequest(params: {
+  host: string;
+  port: number;
+  requestTarget: string;
+  headers?: readonly string[];
+}): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const socket = connect({ host: params.host, port: params.port }, () => {
+      const headers = params.headers ?? ["Host: localhost", "Connection: close"];
+      socket.write([`GET ${params.requestTarget} HTTP/1.1`, ...headers, "", ""].join("\r\n"));
+    });
+    let response = "";
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.setTimeout(0);
+      fn();
+    };
+    socket.setEncoding("utf8");
+    socket.setTimeout(WS_REJECT_TIMEOUT_MS, () => {
+      const error = new Error("timeout");
+      finish(() => {
+        socket.destroy(error);
+        reject(error);
+      });
+    });
+    socket.on("data", (chunk) => {
+      response += chunk;
+    });
+    socket.once("end", () => {
+      finish(() => resolve(response));
+    });
+    socket.once("close", () => {
+      finish(() => resolve(response));
+    });
+    socket.once("error", (err) => {
       finish(() => reject(err));
     });
   });
@@ -400,6 +452,53 @@ describe("gateway plugin node capability auth", () => {
     }, "openclaw-canvas-auth-test-");
   }, 60_000);
 
+  test("rejects malformed raw HTTP request targets without disrupting gateway", async () => {
+    await withCanvasGatewayHarness({
+      resolvedAuth: tokenResolvedAuth,
+      handleHttpRequest: allowCanvasHostHttp,
+      run: async ({ listener }) => {
+        for (const requestTarget of ["//", "///", "//${jndi:ldap://example}.action"]) {
+          const response = await sendRawHttpRequest({
+            host: "127.0.0.1",
+            port: listener.port,
+            requestTarget,
+          });
+          expect(response).toMatch(/^HTTP\/1\.1 401 /);
+        }
+
+        const res = await fetchCanvas(`http://127.0.0.1:${listener.port}${CANVAS_HOST_PATH}/`);
+        expect(res.status).toBe(401);
+      },
+    });
+  }, 60_000);
+
+  test("rejects malformed raw WebSocket upgrade targets without disrupting gateway", async () => {
+    await withCanvasGatewayHarness({
+      resolvedAuth: tokenResolvedAuth,
+      handleHttpRequest: allowCanvasHostHttp,
+      run: async ({ listener }) => {
+        for (const requestTarget of ["//", "///", "//${jndi:ldap://example}.action"]) {
+          const response = await sendRawHttpRequest({
+            host: "127.0.0.1",
+            port: listener.port,
+            requestTarget,
+            headers: [
+              "Host: localhost",
+              "Upgrade: websocket",
+              "Connection: Upgrade",
+              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+              "Sec-WebSocket-Version: 13",
+            ],
+          });
+          expect(response).toMatch(/^HTTP\/1\.1 401 /);
+        }
+
+        const res = await fetchCanvas(`http://127.0.0.1:${listener.port}${CANVAS_HOST_PATH}/`);
+        expect(res.status).toBe(401);
+      },
+    });
+  }, 60_000);
+
   test("denies canvas auth when trusted proxy omits forwarded client headers", async () => {
     await withLoopbackTrustedProxy(async () => {
       await withCanvasGatewayHarness({
@@ -545,7 +644,7 @@ describe("gateway plugin node capability auth", () => {
             },
           );
           expect(second.status).toBe(429);
-          expect(second.headers.get("retry-after")).toBeTruthy();
+          expect(second.headers.get("retry-after")).toMatch(/^\d+$/);
 
           await expectWsRejected(`ws://127.0.0.1:${listener.port}${CANVAS_WS_PATH}`, headers, 429);
         },

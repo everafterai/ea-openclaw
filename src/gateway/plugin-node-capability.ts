@@ -1,6 +1,5 @@
 import { randomBytes } from "node:crypto";
 import { safeEqualSecret } from "../security/secret-equal.js";
-import type { GatewayWsClient } from "./server/ws-types.js";
 
 export const PLUGIN_NODE_CAPABILITY_PATH_PREFIX = "/__openclaw__/cap";
 const PLUGIN_NODE_CAPABILITY_QUERY_PARAM = "oc_cap";
@@ -131,7 +130,16 @@ export function replacePluginNodeCapabilityInScopedHostUrl(
 export function normalizePluginNodeCapabilityScopedUrl(
   rawUrl: string,
 ): NormalizedPluginNodeCapabilityUrl {
-  const url = new URL(rawUrl, "http://localhost");
+  let url: URL;
+  try {
+    url = new URL(rawUrl, "http://localhost");
+  } catch {
+    return {
+      pathname: "/",
+      scopedPath: false,
+      malformedScopedPath: true,
+    };
+  }
   const prefix = `${PLUGIN_NODE_CAPABILITY_PATH_PREFIX}/`;
   let scopedPath = false;
   let malformedScopedPath = false;
@@ -241,7 +249,7 @@ export function refreshClientPluginNodeCapability(params: {
 }
 
 export function hasAuthorizedPluginNodeCapability(params: {
-  clients: Set<GatewayWsClient>;
+  clients: Iterable<PluginNodeCapabilityClient>;
   surface: PluginNodeCapabilitySurface;
   capability: string;
   nowMs?: number;

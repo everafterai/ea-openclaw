@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withEnvAsync } from "../test-utils/env.js";
@@ -136,42 +136,56 @@ vi.mock("./model-auth-env-vars.js", () => {
     voyage: ["VOYAGE_API_KEY"],
     zai: ["ZAI_API_KEY", "Z_AI_API_KEY"],
   } as const;
+  const aliasMap = {
+    modelstudio: "qwen",
+    qwencloud: "qwen",
+    "z.ai": "zai",
+    "z-ai": "zai",
+    "opencode-go-auth": "opencode-go",
+    bedrock: "amazon-bedrock",
+    "aws-bedrock": "amazon-bedrock",
+  };
+  const resolveProviderEnvAuthEvidence = (params?: { config?: OpenClawConfig }) => {
+    const evidence = {
+      "google-vertex": [
+        {
+          type: "local-file-with-env",
+          fileEnvVar: "GOOGLE_APPLICATION_CREDENTIALS",
+          fallbackPaths: [
+            "${HOME}/.config/gcloud/application_default_credentials.json",
+            "${APPDATA}/gcloud/application_default_credentials.json",
+          ],
+          requiresAnyEnv: ["GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"],
+          requiresAllEnv: ["GOOGLE_CLOUD_LOCATION"],
+          credentialMarker: "gcp-vertex-credentials",
+          source: "gcloud adc",
+        },
+      ],
+    } satisfies Record<string, readonly unknown[]>;
+    if (!hasAllowedPlugin(params?.config, "workspace-cloud")) {
+      return evidence;
+    }
+    return {
+      ...evidence,
+      "workspace-cloud": [
+        {
+          type: "local-file-with-env",
+          fileEnvVar: "WORKSPACE_CLOUD_CREDENTIALS",
+          credentialMarker: "workspace-cloud-local-credentials",
+          source: "workspace cloud credentials",
+        },
+      ],
+    };
+  };
   return {
-    PROVIDER_ENV_API_KEY_CANDIDATES: candidates,
     listKnownProviderEnvApiKeyNames: () => [...new Set(Object.values(candidates).flat())],
     resolveProviderEnvApiKeyCandidates: () => candidates,
-    resolveProviderEnvAuthEvidence: (params?: { config?: OpenClawConfig }) => {
-      const evidence = {
-        "google-vertex": [
-          {
-            type: "local-file-with-env",
-            fileEnvVar: "GOOGLE_APPLICATION_CREDENTIALS",
-            fallbackPaths: [
-              "${HOME}/.config/gcloud/application_default_credentials.json",
-              "${APPDATA}/gcloud/application_default_credentials.json",
-            ],
-            requiresAnyEnv: ["GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"],
-            requiresAllEnv: ["GOOGLE_CLOUD_LOCATION"],
-            credentialMarker: "gcp-vertex-credentials",
-            source: "gcloud adc",
-          },
-        ],
-      } satisfies Record<string, readonly unknown[]>;
-      if (!hasAllowedPlugin(params?.config, "workspace-cloud")) {
-        return evidence;
-      }
-      return {
-        ...evidence,
-        "workspace-cloud": [
-          {
-            type: "local-file-with-env",
-            fileEnvVar: "WORKSPACE_CLOUD_CREDENTIALS",
-            credentialMarker: "workspace-cloud-local-credentials",
-            source: "workspace cloud credentials",
-          },
-        ],
-      };
-    },
+    resolveProviderEnvAuthEvidence,
+    resolveProviderEnvAuthLookupMaps: (params?: { config?: OpenClawConfig }) => ({
+      aliasMap,
+      envCandidateMap: candidates,
+      authEvidenceMap: resolveProviderEnvAuthEvidence(params),
+    }),
   };
 });
 
@@ -270,6 +284,21 @@ const BEDROCK_PROVIDER_CFG = {
   },
 } as const;
 
+const BEDROCK_PROVIDER_CFG_WITH_PROFILE = {
+  ...BEDROCK_PROVIDER_CFG,
+  auth: {
+    order: {
+      "amazon-bedrock": ["amazon-bedrock:default"],
+    },
+    profiles: {
+      "amazon-bedrock:default": {
+        provider: "amazon-bedrock",
+        mode: "aws-sdk",
+      },
+    },
+  },
+} as const;
+
 async function resolveBedrockProvider() {
   return resolveApiKeyForProvider({
     provider: "amazon-bedrock",
@@ -290,59 +319,31 @@ async function expectBedrockAuthSource(params: {
   });
 }
 
-it("resolves persisted aws-sdk auth profiles without static keys (#69708)", async () => {
-  const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-bedrock-auth-profile-"));
-  try {
-    await fs.writeFile(
-      path.join(agentDir, "auth-profiles.json"),
-      `${JSON.stringify(
-        {
-          version: 1,
-          profiles: {
-            "amazon-bedrock:default": {
-              type: "aws-sdk",
-              provider: "amazon-bedrock",
-              createdAt: "2026-03-15T10:00:00.000Z",
-            },
-          },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-    clearRuntimeAuthProfileStoreSnapshots();
-    const store = ensureAuthProfileStore(agentDir);
+it("resolves config-only aws-sdk profiles without stored credentials", async () => {
+  const resolved = await resolveApiKeyForProvider({
+    provider: "amazon-bedrock",
+    profileId: "amazon-bedrock:default",
+    store: { version: 1, profiles: {} },
+    cfg: BEDROCK_PROVIDER_CFG_WITH_PROFILE as never,
+  });
 
-    const resolved = await resolveApiKeyForProvider({
-      provider: "amazon-bedrock",
-      profileId: "amazon-bedrock:default",
-      cfg: BEDROCK_PROVIDER_CFG as never,
-      store,
-      agentDir,
-    });
+  expect(resolved.mode).toBe("aws-sdk");
+  expect(resolved.profileId).toBe("amazon-bedrock:default");
+  expect(resolved.source).toBe("profile:amazon-bedrock:default");
+  expect(resolved.apiKey).toBeUndefined();
+});
 
-    expect(resolved).toMatchObject({
-      mode: "aws-sdk",
-      profileId: "amazon-bedrock:default",
-      source: "profile:amazon-bedrock:default",
-    });
-    expect(resolved.apiKey).toBeUndefined();
-    await expect(
-      hasAvailableAuthForProvider({
-        provider: "amazon-bedrock",
-        cfg: BEDROCK_PROVIDER_CFG as never,
-        store,
-        agentDir,
-      }),
-    ).resolves.toBe(true);
-    expect(resolveModelAuthMode("amazon-bedrock", BEDROCK_PROVIDER_CFG as never, store)).toBe(
-      "aws-sdk",
-    );
-  } finally {
-    await fs.rm(agentDir, { recursive: true, force: true });
-    clearRuntimeAuthProfileStoreSnapshots();
-  }
+it("uses configured aws-sdk profile order without stored credentials", async () => {
+  const resolved = await resolveApiKeyForProvider({
+    provider: "amazon-bedrock",
+    store: { version: 1, profiles: {} },
+    cfg: BEDROCK_PROVIDER_CFG_WITH_PROFILE as never,
+  });
+
+  expect(resolved.mode).toBe("aws-sdk");
+  expect(resolved.profileId).toBe("amazon-bedrock:default");
+  expect(resolved.source).toBe("profile:amazon-bedrock:default");
+  expect(resolved.apiKey).toBeUndefined();
 });
 
 function buildDemoLocalStore(keys: string[]) {
@@ -381,15 +382,13 @@ async function resolveDemoLocalApiKey(params: {
   storedKeys: string[];
   configuredApiKey: string;
 }) {
-  let resolved!: Awaited<ReturnType<typeof resolveApiKeyForProvider>>;
-  await withEnvAsync({ DEMO_LOCAL_API_KEY: params.envApiKey }, async () => {
-    resolved = await resolveApiKeyForProvider({
+  return await withEnvAsync({ DEMO_LOCAL_API_KEY: params.envApiKey }, async () => {
+    return await resolveApiKeyForProvider({
       provider: "demo-local",
       store: buildDemoLocalStore(params.storedKeys),
       cfg: buildDemoLocalProviderCfg(params.configuredApiKey),
     });
   });
-  return resolved;
 }
 
 describe("getApiKeyForModel", () => {
@@ -428,6 +427,94 @@ describe("getApiKeyForModel", () => {
           agentDir: process.env.OPENCLAW_AGENT_DIR,
         });
         expect(apiKey.apiKey).toBe(oauthFixture.access);
+      },
+    );
+  });
+
+  it("uses the config default agent dir when resolving provider profiles", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-auth-agent-dir-",
+        agentEnv: "clear",
+        env: {
+          XAI_API_KEY: undefined,
+        },
+      },
+      async (state) => {
+        await state.writeAuthProfiles(
+          {
+            version: 1,
+            profiles: {
+              "xai:default": {
+                type: "api_key",
+                provider: "xai",
+                key: "process-default-key",
+              },
+            },
+          },
+          "main",
+        );
+        await state.writeAuthProfiles(
+          {
+            version: 1,
+            profiles: {
+              "xai:default": {
+                type: "api_key",
+                provider: "xai",
+                key: "configured-agent-key",
+              },
+            },
+          },
+          "configured",
+        );
+
+        const cfg: OpenClawConfig = {
+          agents: {
+            list: [
+              {
+                id: "configured",
+                default: true,
+                agentDir: state.agentDir("configured"),
+              },
+            ],
+          },
+        };
+
+        const resolved = await resolveApiKeyForProvider({ provider: "xai", cfg });
+        expect(resolved.apiKey).toBe("configured-agent-key");
+        expect(resolved.source).toBe("profile:xai:default");
+      },
+    );
+  });
+
+  it("reports the config default agent dir when provider auth is missing", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-auth-missing-agent-dir-",
+        agentEnv: "clear",
+        env: {
+          XAI_API_KEY: undefined,
+        },
+      },
+      async (state) => {
+        const configuredAgentDir = state.agentDir("configured");
+        const cfg: OpenClawConfig = {
+          agents: {
+            list: [
+              {
+                id: "configured",
+                default: true,
+                agentDir: configuredAgentDir,
+              },
+            ],
+          },
+        };
+
+        await expect(resolveApiKeyForProvider({ provider: "xai", cfg })).rejects.toThrow(
+          `agentDir: ${configuredAgentDir}`,
+        );
       },
     );
   });
@@ -512,18 +599,17 @@ describe("getApiKeyForModel", () => {
       },
       async () => {
         const resolved = await resolveApiKeyForProvider({ provider: "claude-cli" });
-        expect(resolved).toMatchObject({
-          apiKey: "claude-cli-access",
-          profileId: "anthropic:claude-cli",
-          source: "profile:anthropic:claude-cli",
-          mode: "oauth",
-        });
+        expect(resolved.apiKey).toBe("claude-cli-access");
+        expect(resolved.profileId).toBe("anthropic:claude-cli");
+        expect(resolved.source).toBe("profile:anthropic:claude-cli");
+        expect(resolved.mode).toBe("oauth");
       },
     );
 
-    expect(cliCredentialMocks.readClaudeCliCredentialsCached).toHaveBeenCalledWith(
-      expect.objectContaining({ allowKeychainPrompt: false }),
-    );
+    const options = cliCredentialMocks.readClaudeCliCredentialsCached.mock.calls.at(0)?.[0] as
+      | { allowKeychainPrompt?: boolean }
+      | undefined;
+    expect(options?.allowKeychainPrompt).toBe(false);
   });
 
   it("throws when ZAI API key is missing", async () => {
@@ -677,27 +763,27 @@ describe("getApiKeyForModel", () => {
 
     try {
       await withEnvAsync({ WORKSPACE_CLOUD_CREDENTIALS: credentialsPath }, async () => {
-        expect(
+        await expect(
           hasAuthForModelProvider({
             provider: "workspace-cloud",
             cfg: { plugins: { allow: ["workspace-cloud"] } },
             store,
           }),
-        ).toBe(true);
-        expect(
+        ).resolves.toBe(true);
+        await expect(
           hasAuthForModelProvider({
             provider: "workspace-cloud",
             cfg: { plugins: {} },
             store,
           }),
-        ).toBe(false);
+        ).resolves.toBe(false);
       });
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 
-  it("reuses runtime auth availability for provider auth checks", () => {
+  it("reuses runtime auth availability for provider auth checks", async () => {
     const store = { version: 1 as const, profiles: {} };
     const localNoKeyConfig = {
       models: {
@@ -716,30 +802,30 @@ describe("getApiKeyForModel", () => {
       },
     } as OpenClawConfig;
 
-    expect(
+    await expect(
       hasAuthForModelProvider({
         provider: "amazon-bedrock",
         cfg: {} as OpenClawConfig,
         env: {},
         store,
       }),
-    ).toBe(true);
-    expect(
+    ).resolves.toBe(true);
+    await expect(
       hasAuthForModelProvider({
         provider: "vllm",
         cfg: localNoKeyConfig,
         env: {},
         store,
       }),
-    ).toBe(true);
-    expect(
+    ).resolves.toBe(true);
+    await expect(
       hasAuthForModelProvider({
         provider: "remote",
         cfg: localNoKeyConfig,
         env: {},
         store,
       }),
-    ).toBe(false);
+    ).resolves.toBe(false);
   });
 
   it("hasAvailableAuthForProvider('google') accepts GOOGLE_API_KEY fallback", async () => {
@@ -1118,7 +1204,7 @@ describe("getApiKeyForModel", () => {
     );
   });
 
-  it("resolveEnvApiKey('anthropic-vertex') uses the provided env snapshot", async () => {
+  it("resolveEnvApiKey('anthropic-vertex') uses the provided env snapshot", () => {
     const resolved = resolveEnvApiKey("anthropic-vertex", {
       GOOGLE_CLOUD_PROJECT_ID: "vertex-project",
     } as NodeJS.ProcessEnv);
@@ -1126,7 +1212,7 @@ describe("getApiKeyForModel", () => {
     expect(resolved).toBeNull();
   });
 
-  it("resolveEnvApiKey('google-vertex') uses the provided env snapshot", async () => {
+  it("resolveEnvApiKey('google-vertex') uses the provided env snapshot", () => {
     const resolved = resolveEnvApiKey("google-vertex", {
       GOOGLE_CLOUD_API_KEY: "google-cloud-api-key",
     } as NodeJS.ProcessEnv);
@@ -1333,12 +1419,28 @@ describe("getApiKeyForModel", () => {
     });
   });
 
-  it("resolveEnvApiKey('anthropic-vertex') accepts explicit metadata auth opt-in", async () => {
+  it("resolveEnvApiKey('anthropic-vertex') accepts explicit metadata auth opt-in", () => {
     const resolved = resolveEnvApiKey("anthropic-vertex", {
       ANTHROPIC_VERTEX_USE_GCP_METADATA: "true",
     } as NodeJS.ProcessEnv);
 
     expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
     expect(resolved?.source).toBe("gcloud adc");
+  });
+
+  it("resolveEnvApiKey skips plugin setup fallback when precomputed maps are authoritative", () => {
+    const resolved = resolveEnvApiKey(
+      "anthropic-vertex",
+      {
+        ANTHROPIC_VERTEX_USE_GCP_METADATA: "true",
+      } as NodeJS.ProcessEnv,
+      {
+        candidateMap: {},
+        authEvidenceMap: {},
+        skipSetupProviderFallback: true,
+      },
+    );
+
+    expect(resolved).toBeNull();
   });
 });

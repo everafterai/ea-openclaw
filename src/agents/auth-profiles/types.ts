@@ -29,17 +29,6 @@ export type ApiKeyCredential = {
   metadata?: Record<string, string>;
 };
 
-export type AwsSdkCredential = {
-  type: "aws-sdk";
-  provider: string;
-  /** Explicit opt-out for copying this profile when creating another agent. */
-  copyToAgents?: boolean;
-  email?: string;
-  displayName?: string;
-  /** Optional provider-specific metadata (e.g., account IDs, regions). */
-  metadata?: Record<string, string>;
-};
-
 export type TokenCredential = {
   /**
    * Static bearer-style token (often OAuth access token / PAT).
@@ -70,11 +59,7 @@ export type OAuthCredential = OAuthCredentials & {
   displayName?: string;
 };
 
-export type AuthProfileCredential =
-  | ApiKeyCredential
-  | AwsSdkCredential
-  | TokenCredential
-  | OAuthCredential;
+export type AuthProfileCredential = ApiKeyCredential | TokenCredential | OAuthCredential;
 
 export type AuthProfileFailureReason =
   | "auth"
@@ -91,9 +76,16 @@ export type AuthProfileFailureReason =
   | "unclassified"
   | "unknown";
 
+export type AuthProfileBlockedReason = "subscription_limit";
+export type AuthProfileBlockedSource = "codex_rate_limits" | "wham";
+
 /** Per-profile usage statistics for round-robin and cooldown tracking */
 export type ProfileUsageStats = {
   lastUsed?: number;
+  blockedUntil?: number;
+  blockedReason?: AuthProfileBlockedReason;
+  blockedSource?: AuthProfileBlockedSource;
+  blockedModel?: string;
   cooldownUntil?: number;
   cooldownReason?: AuthProfileFailureReason;
   cooldownModel?: string;
@@ -125,7 +117,13 @@ export type AuthProfileStateStore = {
   version: number;
 } & AuthProfileState;
 
-export type AuthProfileStore = AuthProfileSecretsStore & AuthProfileState;
+export type AuthProfileStore = AuthProfileSecretsStore &
+  AuthProfileState & {
+    /** Runtime-only provenance for external OAuth profiles overlaid onto this store. */
+    runtimeExternalProfileIds?: string[];
+    /** True when the runtime external profile set was freshly resolved, even if empty. */
+    runtimeExternalProfileIdsAuthoritative?: boolean;
+  };
 
 export type AuthProfileIdRepairResult = {
   config: OpenClawConfig;

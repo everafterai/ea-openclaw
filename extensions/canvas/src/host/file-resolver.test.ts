@@ -1,14 +1,28 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { createTrackedTempDirs } from "../../../../src/test-utils/tracked-temp-dirs.js";
+import { resolvePreferredOpenClawTmpDir, withTempWorkspace } from "openclaw/plugin-sdk/temp-path";
+import { describe, expect, it } from "vitest";
 import { normalizeUrlPath, resolveFileWithinRoot } from "./file-resolver.js";
 
-const tempDirs = createTrackedTempDirs();
+type ResolvedFile = NonNullable<Awaited<ReturnType<typeof resolveFileWithinRoot>>>;
 
-afterEach(async () => {
-  await tempDirs.cleanup();
-});
+async function withCanvasTemp<T>(prefix: string, run: (dir: string) => Promise<T>): Promise<T> {
+  return await withTempWorkspace(
+    { rootDir: resolvePreferredOpenClawTmpDir(), prefix },
+    async ({ dir }) => await run(dir),
+  );
+}
+
+function expectResolvedFile(
+  result: Awaited<ReturnType<typeof resolveFileWithinRoot>>,
+): ResolvedFile {
+  if (result === null) {
+    throw new Error("Expected resolved file within root");
+  }
+  expect(typeof result.handle.close).toBe("function");
+  expect(typeof result.handle.readFile).toBe("function");
+  return result;
+}
 
 describe("resolveFileWithinRoot", () => {
   it("normalizes URL paths", () => {
@@ -17,33 +31,44 @@ describe("resolveFileWithinRoot", () => {
   });
 
   it("opens directory index files through the fs-safe root", async () => {
-    const root = await tempDirs.make("openclaw-canvas-resolver-");
-    await fs.mkdir(path.join(root, "docs"), { recursive: true });
-    await fs.writeFile(path.join(root, "docs", "index.html"), "<h1>docs</h1>");
+    await withCanvasTemp("openclaw-canvas-resolver-", async (root) => {
+      await fs.mkdir(path.join(root, "docs"), { recursive: true });
+      await fs.writeFile(path.join(root, "docs", "index.html"), "<h1>docs</h1>");
 
-    const result = await resolveFileWithinRoot(root, "/docs");
-    expect(result).not.toBeNull();
-    try {
-      await expect(result?.handle.readFile({ encoding: "utf8" })).resolves.toBe("<h1>docs</h1>");
-    } finally {
-      await result?.handle.close().catch(() => {});
-    }
+      const result = await resolveFileWithinRoot(root, "/docs");
+      const resolved = expectResolvedFile(result);
+      try {
+        await expect(resolved.handle.readFile({ encoding: "utf8" })).resolves.toBe("<h1>docs</h1>");
+      } finally {
+        await resolved.handle.close().catch(() => {});
+      }
+    });
   });
 
   it("rejects traversal paths", async () => {
-    const root = await tempDirs.make("openclaw-canvas-resolver-");
+    await withCanvasTemp("openclaw-canvas-resolver-", async (root) => {
+      await fs.writeFile(path.join(root, "outside.txt"), "inside-root", "utf8");
+      await expect(resolveFileWithinRoot(root, "/../outside.txt")).resolves.toBeNull();
+      await expect(resolveFileWithinRoot(root, "/%2e%2e%2foutside.txt")).resolves.toBeNull();
+    });
+  });
 
-    await expect(resolveFileWithinRoot(root, "/../outside.txt")).resolves.toBeNull();
+  it("rejects malformed URL encoding as a missing file", async () => {
+    await withCanvasTemp("openclaw-canvas-resolver-", async (root) => {
+      await expect(resolveFileWithinRoot(root, "/%E0%A4%A")).resolves.toBeNull();
+    });
   });
 
   it.runIf(process.platform !== "win32")("rejects symlink entries", async () => {
-    const root = await tempDirs.make("openclaw-canvas-resolver-");
-    const outside = await tempDirs.make("openclaw-canvas-resolver-outside-");
-    const target = path.join(outside, "outside.html");
-    const link = path.join(root, "link.html");
-    await fs.writeFile(target, "outside");
-    await fs.symlink(target, link);
+    await withCanvasTemp("openclaw-canvas-resolver-", async (root) => {
+      await withCanvasTemp("openclaw-canvas-resolver-outside-", async (outside) => {
+        const target = path.join(outside, "outside.html");
+        const link = path.join(root, "link.html");
+        await fs.writeFile(target, "outside");
+        await fs.symlink(target, link);
 
-    await expect(resolveFileWithinRoot(root, "/link.html")).resolves.toBeNull();
+        await expect(resolveFileWithinRoot(root, "/link.html")).resolves.toBeNull();
+      });
+    });
   });
 });

@@ -38,6 +38,9 @@ export function resetCliAuthEpochTestDeps(): void {
 }
 
 function hashCliAuthEpochPart(value: string): string {
+  // Epoch hashes detect local auth-state changes; they are not password
+  // storage or credential verification.
+  // codeql[js/insufficient-password-hash]
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
@@ -95,14 +98,6 @@ function encodeAuthProfileCredential(credential: AuthProfileCredential): string 
         credential.provider,
         credential.key ?? null,
         encodeUnknown(credential.keyRef),
-        credential.email ?? null,
-        credential.displayName ?? null,
-        encodeUnknown(credential.metadata),
-      ]);
-    case "aws-sdk":
-      return JSON.stringify([
-        "aws-sdk",
-        credential.provider,
         credential.email ?? null,
         credential.displayName ?? null,
         encodeUnknown(credential.metadata),
